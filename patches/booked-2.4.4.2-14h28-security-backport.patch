@@ -1,0 +1,2263 @@
+diff --git a/booked/assets/js/admin-notice.js b/booked/assets/js/admin-notice.js
+--- a/booked/assets/js/admin-notice.js
++++ b/booked/assets/js/admin-notice.js
+@@ -5,7 +5,8 @@
+             var $notice = $(this).parent('.notice.is-dismissible');
+             var dismiss_action = $notice.attr('data-dismiss-action');
+             if (dismiss_action) {
+-               $.post(ajaxurl, {'action': dismiss_action}, function(response) {
++               var nonce = (typeof booked_outdated_vars !== 'undefined' && booked_outdated_vars.nonce) ? booked_outdated_vars.nonce : '';
++               $.post(ajaxurl, {'action': dismiss_action, 'nonce': nonce}, function(response) {
+ 		});
+             }
+         });
+
+diff --git a/booked/booked.php b/booked/booked.php
+--- a/booked/booked.php
++++ b/booked/booked.php
+@@ -3,14 +3,14 @@
+ /*
+ Plugin Name: Booked
+ Plugin URI: https://quickcal.co/booked-upgrade
+-Description: Powerful appointment booking made simple.
+-Version: 2.4.4
+-Author: QuickCal, BoxyStudio
++Description: Powerful appointment booking made simple. (14h28 Security Backport)
++Version: 2.4.4.2
++Author: QuickCal, BoxyStudio (Security Backport: Zied El Ifa)
+ Author URI: https://quickcal.co/booked-upgrade
+ Text Domain: booked
+ */
+ 
+-define( 'BOOKED_VERSION', '2.4.4' );
++define( 'BOOKED_VERSION', '2.4.4.2' );
+ define( 'BOOKED_WELCOME_SCREEN', get_option('booked_welcome_screen',true) );
+ define( 'BOOKED_DEMO_MODE', get_option('booked_demo_mode',false) );
+ define( 'BOOKED_PLUGIN_URL', untrailingslashit( plugin_dir_url( __FILE__ ) ) );
+@@ -271,6 +271,9 @@
+ 		public function admin_init() {
+ 
+ 			if ( current_user_can('edit_booked_appointments') && isset($_POST['booked_export_appointments_csv']) ):
++				if ( ! isset($_POST['booked_export_nonce']) || ! wp_verify_nonce( $_POST['booked_export_nonce'], 'booked_export_csv_nonce' ) ) {
++					wp_die( esc_html__( 'Security check failed.', 'booked' ), 403 );
++				}
+ 				include('includes/export-csv.php');
+ 			endif;
+ 
+@@ -606,9 +609,18 @@
+                             array( 'jquery' ),
+                             '1.0'
+                         );
++                        wp_localize_script(
++                            'booked-outdated',
++                            'booked_outdated_vars',
++                            array( 'nonce' => wp_create_nonce( 'booked_dismiss_outdated_nonce' ) )
++                        );
+                     }
+                 }
+                 public function booked_dismiss_outdated_notice() {
++                    if ( ! is_user_logged_in() || ! current_user_can( 'activate_plugins' ) ) {
++                        wp_die( '', '', array( 'response' => 403 ) );
++                    }
++                    check_ajax_referer( 'booked_dismiss_outdated_nonce', 'nonce' );
+                     
+                     $cache_key = 'booked_outdated_notice_'. get_current_user_id();
+                     $next_time_in_days = (INT)get_option($cache_key);
+@@ -766,14 +778,18 @@
+ 		SAVE USER FIELD FROM CALENDAR TAXONOMY PAGE
+ 		**********************/
+ 		public function booked_save_calendars_custom_fields( $term_id ) {
+-			if ( isset( $_POST['term_meta'] ) ) {
+-				$t_id = $term_id;
++			if ( ! current_user_can( 'manage_booked_options' ) ) {
++				return;
++			}
++			if ( isset( $_POST['term_meta'] ) && is_array( $_POST['term_meta'] ) ) {
++				$t_id = intval( $term_id );
+ 				$term_meta = get_option( "taxonomy_$t_id", [] );//default array
+ 				$cat_keys = array_keys( $_POST['term_meta'] );
+ 
+ 				foreach ( $cat_keys as $key ) {
+-					if ( isset ( $_POST['term_meta'][$key] ) ) {
+-						$term_meta[$key] = $_POST['term_meta'][$key];
++					$clean_key = sanitize_key( $key );
++					if ( isset( $_POST['term_meta'][$key] ) ) {
++						$term_meta[$clean_key] = sanitize_text_field( wp_unslash( $_POST['term_meta'][$key] ) );
+ 					}
+ 				}
+ 				update_option( "taxonomy_$t_id", $term_meta );
+
+diff --git a/booked/includes/add-ons/calendar-feeds/booked-calendar-feeds.php b/booked/includes/add-ons/calendar-feeds/booked-calendar-feeds.php
+--- a/booked/includes/add-ons/calendar-feeds/booked-calendar-feeds.php
++++ b/booked/includes/add-ons/calendar-feeds/booked-calendar-feeds.php
+@@ -11,13 +11,14 @@
+ 
+ add_action('plugins_loaded','init_booked_calendar_feeds');
+ function init_booked_calendar_feeds(){
+-        if(get_option('quickcal_feed_hash', false)){
+-            $secure_hash = get_option('quickcal_feed_hash');
+-        }
+-        else{
+-            $random_string = md5(time().'Xyb'.rand(time(), time()+500).'KJD');
+-            $secure_hash = str_shuffle($random_string);
+-            update_option('quickcal_feed_hash', $secure_hash);
++        $secure_hash = get_option('quickcal_feed_hash', false);
++        if ( ! is_string( $secure_hash ) || strlen( $secure_hash ) < 64 ) {
++            if ( function_exists( 'random_bytes' ) ) {
++                $secure_hash = bin2hex( random_bytes( 32 ) );
++            } else {
++                $secure_hash = wp_generate_password( 64, false, false );
++            }
++            update_option( 'quickcal_feed_hash', $secure_hash );
+         }
+         
+ 	define('BOOKEDICAL_SECURE_HASH',$secure_hash);
+
+diff --git a/booked/includes/add-ons/calendar-feeds/calendar-feed.php b/booked/includes/add-ons/calendar-feeds/calendar-feed.php
+--- a/booked/includes/add-ons/calendar-feeds/calendar-feed.php
++++ b/booked/includes/add-ons/calendar-feeds/calendar-feed.php
+@@ -1,13 +1,13 @@
+ <?php
+ 
+-if ( !isset($_GET['sh']) || isset($_GET['sh']) && $_GET['sh'] != BOOKEDICAL_SECURE_HASH )
++if ( ! isset( $_GET['sh'] ) || ! is_string( $_GET['sh'] ) || ! hash_equals( (string) BOOKEDICAL_SECURE_HASH, (string) wp_unslash( $_GET['sh'] ) ) )
+ 	wp_die('<strong>Calendar Feed Requirements:</strong><br>The Booked calendar feeds now require a secure hash to access. Please take a look at your "Appointments > Calendar Feeds" page for the updated feed URLs.');
+ 
+ header('Content-type: text/calendar; charset=utf-8');
+-header('Content-Disposition: attachment; filename=appointment-feed-'.BOOKED_VERSION.'.ics');
++header('Content-Disposition: attachment; filename=appointment-feed-'.sanitize_file_name( BOOKED_VERSION ).'.ics');
+ 
+ if (isset($_GET['calendar']) && $_GET['calendar']):
+-	$calendar_id = esc_html( $_GET['calendar'] );
++	$calendar_id = intval( $_GET['calendar'] );
+ else:
+ 	$calendar_id = false;
+ endif;
+@@ -169,9 +169,9 @@
+ ?>DTSTART;VALUE=DATE:<?php echo $formatted_start_date; ?><?php echo "\r\n"; ?>
+ DTEND;VALUE=DATE:<?php echo $formatted_start_date; ?><?php echo "\r\n"; ?><?php
+ endif;
+-?>SUMMARY:<?php echo apply_filters( 'booked_calendar_feed_display_name', $display_name, $appt_id ); ?><?php echo "\r\n"; ?>
++?>SUMMARY:<?php echo clean_calendarString( apply_filters( 'booked_calendar_feed_display_name', $display_name, $appt_id ) ); ?><?php echo "\r\n"; ?>
+ <?php echo ( $description ? "DESCRIPTION:" . $description . "\r\n" : "" ); ?>
+-UID:booked-appointment-<?php echo $appt_id; ?><?php echo "\r\n"; ?>
++UID:booked-appointment-<?php echo intval( $appt_id ); ?><?php echo "\r\n"; ?>
+ END:VEVENT<?php echo "\r\n"; ?>
+ <?php
+ 
+@@ -203,13 +203,20 @@
+ 			endforeach;
+ 		endif;
+ 
++		$string = wp_strip_all_tags( $string );
++
+ 		if (function_exists('mb_convert_encoding')):
+ 			$string = mb_convert_encoding( $string, 'UTF-8' );
+ 		else:
+ 			$string = htmlspecialchars_decode(utf8_decode(htmlentities($string, ENT_COMPAT, 'utf-8', false)));
+ 		endif;
+ 
+-		return preg_replace( "/([\,\;])/","\\\$1", $string);
++		// RFC 5545 escaping against iCalendar property injection (backslash, semicolon, comma, CR/LF)
++		$string = str_replace( '\\', '\\\\', $string );
++		$string = str_replace( array( "\r\n", "\r", "\n" ), '\\n', $string );
++		$string = preg_replace( '/([\,\;])/', '\\\$1', $string );
++
++		return $string;
+ 
+ 	else:
+ 
+@@ -225,8 +232,8 @@
+ 	ob_start();
+ 
+ 	foreach($cf_fields as $field):
+-		echo trim( $field['title'] ) . "\\n";
+-		echo trim( $field['content'] ) . "\r\n";
++		echo clean_calendarString( trim( $field['title'] ) ) . "\\n";
++		echo clean_calendarString( trim( $field['content'] ) ) . "\r\n";
+ 	endforeach;
+ 
+ 	return ob_get_clean();
+
+diff --git a/booked/includes/add-ons/frontend-agents/booked-frontend-agents.php b/booked/includes/add-ons/frontend-agents/booked-frontend-agents.php
+--- a/booked/includes/add-ons/frontend-agents/booked-frontend-agents.php
++++ b/booked/includes/add-ons/frontend-agents/booked-frontend-agents.php
+@@ -68,6 +68,7 @@
+         );
+         $booked_fea_vars = [
+             'ajax_url' => admin_url('admin-ajax.php'),
++            'nonce'    => wp_create_nonce('ajax-fea-nonce'),
+             'i18n_confirm_appt_delete' => __(
+                 'Are you sure you want to cancel this appointment?',
+                 'booked'
+
+diff --git a/booked/includes/add-ons/frontend-agents/includes/ajax.php b/booked/includes/add-ons/frontend-agents/includes/ajax.php
+--- a/booked/includes/add-ons/frontend-agents/includes/ajax.php
++++ b/booked/includes/add-ons/frontend-agents/includes/ajax.php
+@@ -14,12 +14,25 @@
+ 		
+ 		}
+ 			
++		public static function verify_agent_request( $appt_id = 0 ) {
++			if ( ! is_user_logged_in() || ! current_user_can( 'edit_booked_appointments' ) ) {
++				wp_die( '', '', array( 'response' => 403 ) );
++			}
++			if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], 'ajax-fea-nonce' ) ) {
++				wp_die( 'Required "nonce" value is not here, please let the developer know.', '', array( 'response' => 403 ) );
++			}
++			if ( ! booked_user_can_manage_appointment( $appt_id ) ) {
++				wp_die( '', '', array( 'response' => 403 ) );
++			}
++		}
++			
+ 		// Delete an Appointment
+ 		public function booked_fea_delete_appt(){
+ 			
+-			if ( isset($_POST['appt_id']) && current_user_can('edit_booked_appointments') ):
++			if ( isset($_POST['appt_id']) ):
+ 		
+-				$appt_id = esc_html( $_POST['appt_id'] );
++				$appt_id = intval( $_POST['appt_id'] );
++				self::verify_agent_request( $appt_id );
+ 				$post_type = get_post_type( $appt_id );
+ 				
+ 				if ( $post_type == 'booked_appointments' ):
+@@ -44,7 +57,7 @@
+ 				endif;
+ 			
+ 			endif;
+-			
++			wp_die();
+ 		}
+ 		
+ 		// Approve an Appointment
+@@ -52,7 +65,8 @@
+ 			
+ 			if (isset($_POST['appt_id'])):
+ 		
+-				$appt_id = esc_html( $_POST['appt_id'] );
++				$appt_id = intval( $_POST['appt_id'] );
++				self::verify_agent_request( $appt_id );
+ 		
+ 				// Send an email to the user?
+ 				$email_content = get_option('booked_approval_email_content');
+@@ -73,51 +87,53 @@
+ 				wp_die();
+ 				
+ 			endif;
+-			
++			wp_die();
+ 		}
+ 		
+ 		// Display the Appointment/User Info Modal
+ 		public function booked_fea_user_info_modal(){
+ 			
+-			if (isset($_POST['user_id'])):
++			if (isset($_POST['user_id']) && isset($_POST['appt_id'])):
++				$appt_id = intval( $_POST['appt_id'] );
++				self::verify_agent_request( $appt_id );
++				$user_id = intval( get_post_meta( $appt_id, '_appointment_user', true ) );
+ 			
+ 				ob_start();
+ 				
+ 				echo '<div class="booked-scrollable">';
+-					echo '<p class="booked-title-bar"><small>' . __('Appointment Information','booked') . '</small></p>';
++					echo '<p class="booked-title-bar"><small>' . esc_html__('Appointment Information','booked') . '</small></p>';
+ 			
+-					if (!$_POST['user_id'] && isset($_POST['appt_id'])):
++					if (!$user_id && $appt_id):
+ 					
+-						$guest_name = get_post_meta($_POST['appt_id'], '_appointment_guest_name',true);
+-						$guest_email = get_post_meta($_POST['appt_id'], '_appointment_guest_email',true);
++						$guest_name = get_post_meta($appt_id, '_appointment_guest_name',true);
++						$guest_email = get_post_meta($appt_id, '_appointment_guest_email',true);
+ 					
+-						echo '<p class="fea-modal-title">'.__('Contact Information','booked').'</p>';
+-						echo '<p><strong class="booked-left-title">'.__('Name','booked').':</strong> '.$guest_name.'<br>';
+-						if ($guest_email) : echo '<strong class="booked-left-title">'.__('Email','booked').':</strong> <a href="mailto:'.$guest_email.'">'.$guest_email.'</a>'; endif;
++						echo '<p class="fea-modal-title">'.esc_html__('Contact Information','booked').'</p>';
++						echo '<p><strong class="booked-left-title">'.esc_html__('Name','booked').':</strong> '.esc_html($guest_name).'<br>';
++						if ($guest_email) : echo '<strong class="booked-left-title">'.esc_html__('Email','booked').':</strong> <a href="mailto:'.esc_attr($guest_email).'">'.esc_html($guest_email).'</a>'; endif;
+ 						echo '</p>';
+ 						
+ 					else :
+ 			
+ 						// Customer Information
+-						$user_info = get_userdata($_POST['user_id']);
+-						$display_name = booked_get_name($_POST['user_id']);
+-						$email = $user_info->user_email;
+-						$phone = get_user_meta($_POST['user_id'], 'booked_phone', true);
++						$user_info = get_userdata($user_id);
++						$display_name = booked_get_name($user_id);
++						$email = ! empty( $user_info ) ? $user_info->user_email : '';
++						$phone = get_user_meta($user_id, 'booked_phone', true);
+ 				
+-						echo '<p class="fea-modal-title">'.__('Contact Information','booked').'</p>';
+-						echo '<p><strong class="booked-left-title">'.__('Name','booked').':</strong> '.$display_name.'<br>';
+-						if ($email) : echo '<strong class="booked-left-title">'.__('Email','booked').':</strong> <a href="mailto:'.$email.'">'.$email.'</a><br>'; endif;
+-						if ($phone) : echo '<strong class="booked-left-title">'.__('Phone','booked').':</strong> <a href="tel:'.preg_replace('/[^0-9+]/', '', $phone).'">'.$phone.'</a>'; endif;
++						echo '<p class="fea-modal-title">'.esc_html__('Contact Information','booked').'</p>';
++						echo '<p><strong class="booked-left-title">'.esc_html__('Name','booked').':</strong> '.esc_html($display_name).'<br>';
++						if ($email) : echo '<strong class="booked-left-title">'.__('Email','booked').':</strong> <a href="mailto:'.esc_attr($email).'">'.esc_html($email).'</a><br>'; endif;
++						if ($phone) : echo '<strong class="booked-left-title">'.__('Phone','booked').':</strong> <a href="tel:'.esc_attr(preg_replace('/[^0-9+]/', '', $phone)).'">'.esc_html($phone).'</a>'; endif;
+ 						echo '</p>';
+ 			
+ 					endif;
+ 			
+ 					// Appointment Information
+-					if (isset($_POST['appt_id'])):
++					if ($appt_id):
+ 			
+ 						$time_format = get_option('time_format');
+ 						$date_format = get_option('date_format');
+-						$appt_id = $_POST['appt_id'];
+ 			
+ 						$timestamp = get_post_meta($appt_id, '_appointment_timestamp',true);
+ 						$timeslot = get_post_meta($appt_id, '_appointment_timeslot',true);
+@@ -138,11 +154,11 @@
+ 						
+ 						$cf_meta_value = apply_filters('booked_fea_cf_metavalue',$cf_meta_value);
+ 			
+-						echo '<p class="fea-modal-title fea-bordered">'.__('Appointment Information','booked').'</p>';
++						echo '<p class="fea-modal-title fea-bordered">'.esc_html__('Appointment Information','booked').'</p>';
+ 						do_action('booked_before_appointment_information_admin');
+-						echo '<p><strong class="booked-left-title">'.__('Date','booked').':</strong> '.$day_name.', '.$date_display.'<br>';
+-						echo '<strong class="booked-left-title">'.__('Time','booked').':</strong> '.$timeslotText.'</p>';
+-						echo ($cf_meta_value ? '<div class="cf-meta-values">'.$cf_meta_value.'</div>' : '');
++						echo '<p><strong class="booked-left-title">'.esc_html__('Date','booked').':</strong> '.esc_html($day_name).', '.esc_html($date_display).'<br>';
++						echo '<strong class="booked-left-title">'.esc_html__('Time','booked').':</strong> '.esc_html($timeslotText).'</p>';
++						echo ($cf_meta_value ? '<div class="cf-meta-values">'.wp_kses_post($cf_meta_value).'</div>' : '');
+ 						do_action('booked_after_appointment_information_admin');
+ 			
+ 					endif;
+@@ -155,7 +171,7 @@
+ 				wp_die();
+ 				
+ 			endif;
+-			
++			wp_die();
+ 		}
+ 	}
+ }
+
+diff --git a/booked/includes/add-ons/frontend-agents/includes/shortcodes.php b/booked/includes/add-ons/frontend-agents/includes/shortcodes.php
+--- a/booked/includes/add-ons/frontend-agents/includes/shortcodes.php
++++ b/booked/includes/add-ons/frontend-agents/includes/shortcodes.php
+@@ -195,7 +195,7 @@
+ 							
+ 							do_action('booked_shortcode_appointments_additional_information', $appt['post_id']);
+ 							$cf_meta_value = apply_filters('booked_fea_cf_metavalue',$cf_meta_value);
+-							echo ($cf_meta_value ? '<br><i class="fa-solid fa-circle-info"></i><a href="#" class="booked-show-cf">'.__('Additional information','booked').'</a><div class="cf-meta-values-hidden">'.$cf_meta_value.'</div>' : '');
++							echo ($cf_meta_value ? '<br><i class="fa-solid fa-circle-info"></i><a href="#" class="booked-show-cf">'.esc_html__('Additional information','booked').'</a><div class="cf-meta-values-hidden">'.wp_kses_post($cf_meta_value).'</div>' : '');
+ 							
+ 							if (!$historic):
+ 								if ($appt_date_time >= $date_to_compare):
+
+diff --git a/booked/includes/add-ons/frontend-agents/js/functions.js b/booked/includes/add-ons/frontend-agents/js/functions.js
+--- a/booked/includes/add-ons/frontend-agents/js/functions.js
++++ b/booked/includes/add-ons/frontend-agents/js/functions.js
+@@ -36,6 +36,7 @@
+ 				type: 'post',
+ 				data: {
+ 					action: 'booked_fea_user_info_modal',
++					nonce: booked_fea_vars.nonce,
+ 					user_id: user_id,
+ 					appt_id: appt_id
+ 				},
+@@ -111,6 +112,7 @@
+ 					'url' : booked_ajaxURL,
+ 					'data': {
+ 						'action'     	: 'booked_fea_approve_appt',
++						'nonce'      	: booked_fea_vars.nonce,
+ 						'appt_id'     	: appt_id
+ 					},
+ 					success: function(data) {
+@@ -160,6 +162,7 @@
+ 					'url' : booked_ajaxURL,
+ 					'data': {
+ 						'action'     	: 'booked_fea_delete_appt',
++						'nonce'      	: booked_fea_vars.nonce,
+ 						'appt_id'     	: appt_id
+ 					},
+ 					success: function(data) {
+
+diff --git a/booked/includes/add-ons/woocommerce-payments/fragments/ajax-loaded/appointment-change-date.php b/booked/includes/add-ons/woocommerce-payments/fragments/ajax-loaded/appointment-change-date.php
+--- a/booked/includes/add-ons/woocommerce-payments/fragments/ajax-loaded/appointment-change-date.php
++++ b/booked/includes/add-ons/woocommerce-payments/fragments/ajax-loaded/appointment-change-date.php
+@@ -12,13 +12,19 @@
+ }
+ 
+ $app_id = intval($_POST['app_id']);
+-$app_action = $_POST['app_action'];
+-$source = $_POST['source'];
++$app_action = sanitize_text_field( wp_unslash( $_POST['app_action'] ) );
++$source = sanitize_text_field( wp_unslash( $_POST['source'] ) );
+ $appt_obj = Booked_WC_Appointment::get($app_id);
++$appt_owner = ( $appt_obj && $appt_obj->post ) ? intval( $appt_obj->user_id ? $appt_obj->user_id : $appt_obj->post->post_author ) : 0;
+ $calendar_id = ( isset($appt_obj->calendar->calendar_obj->term_id) ? (int)$appt_obj->calendar->calendar_obj->term_id : 0 );
+ 
+ if (
+ 	!$app_id
++	|| !$appt_obj
++	|| !$appt_obj->post
++	|| $appt_obj->post->post_type !== 'booked_appointments'
++	|| $appt_owner <= 0
++	|| ( $appt_owner !== get_current_user_id() && ! booked_user_can_manage_appointment( $app_id ) )
+ 	|| $app_action!=='edit'
+ 	|| $source!=='booked_wc_extension'
+ ) {
+@@ -56,9 +62,10 @@
+ 
+ 	<p class="booked-title-bar"><small><?php echo __('Update Appointment Date', 'booked'); ?></small></p>
+ 
+-	<form action="" method="post" id="newAppointmentForm" data-calendar-id="<?php echo $calendar_id; ?>">
++	<form action="" method="post" id="newAppointmentForm" data-calendar-id="<?php echo esc_attr( $calendar_id ); ?>">
+ 
+-		<input type="hidden" name="date" value="<?php echo $input_date ?>" />
++		<input type="hidden" name="nonce" value="<?php echo esc_attr( wp_create_nonce( 'ajax-nonce' ) ); ?>" />
++		<input type="hidden" name="date" value="<?php echo esc_attr( $input_date ); ?>" />
+ 		<input type="hidden" name="timestamp" value="<?php echo $input_timestamp ?>" />
+ 		<input type="hidden" name="timeslot" value="<?php echo $timeslot; ?>" />
+ 		<input type="hidden" name="customer_type" value="<?php echo $input_customer_type ?>" />
+
+diff --git a/booked/includes/add-ons/woocommerce-payments/js/admin-functions.js b/booked/includes/add-ons/woocommerce-payments/js/admin-functions.js
+--- a/booked/includes/add-ons/woocommerce-payments/js/admin-functions.js
++++ b/booked/includes/add-ons/woocommerce-payments/js/admin-functions.js
+@@ -24,6 +24,7 @@
+ 
+ 					var data = {
+ 						'action': 'booked_wc_mark_paid',
++						'nonce': booked_wc_variables.nonce,
+ 						'appt_id': parseInt(thisAppt)
+ 					};
+ 
+@@ -106,6 +107,7 @@
+ 
+ 		var data = {
+ 			'action': 'booked_wc_load_variations',
++			'nonce': booked_wc_variables.nonce,
+ 			'product_id': parseInt(product_id),
+ 			'field_name': field_name
+ 		};
+
+diff --git a/booked/includes/add-ons/woocommerce-payments/js/frontend-functions.js b/booked/includes/add-ons/woocommerce-payments/js/frontend-functions.js
+--- a/booked/includes/add-ons/woocommerce-payments/js/frontend-functions.js
++++ b/booked/includes/add-ons/woocommerce-payments/js/frontend-functions.js
+@@ -61,6 +61,7 @@
+ 
+ 		var data = {
+ 			'action': booked_wc_variables.prefix + 'load_variations',
++			'nonce': booked_wc_variables.nonce,
+ 			'product_id': parseInt(product_id),
+ 			'calendar_id': calendar_id,
+ 			'field_name': field_name
+@@ -112,6 +113,7 @@
+ 
+ 				var data = {
+ 					'action': booked_wc_variables.prefix + 'add_to_cart',
++					'nonce': booked_wc_variables.nonce,
+ 					'app_id': appt_id
+ 				};
+ 
+
+diff --git a/booked/includes/add-ons/woocommerce-payments/lib/class-enqueue-scripts.php b/booked/includes/add-ons/woocommerce-payments/lib/class-enqueue-scripts.php
+--- a/booked/includes/add-ons/woocommerce-payments/lib/class-enqueue-scripts.php
++++ b/booked/includes/add-ons/woocommerce-payments/lib/class-enqueue-scripts.php
+@@ -34,6 +34,7 @@
+ 		$js_variables_array = array(
+ 			'prefix' => BOOKED_WC_PLUGIN_PREFIX,
+ 			'ajaxurl' => admin_url('admin-ajax.php'),
++			'nonce' => wp_create_nonce('booked-wc-nonce'),
+ 			'i18n_confirm_appt_edit' => __('Are you sure you want to change the appointment date? By doing so, the appointment date will need to be approved again.', 'booked'),
+ 			'i18n_pay' => __('Are you sure you want to add the appointment to cart and go to checkout?', 'booked'),
+ 			'i18n_mark_paid' => __('Are you sure you want to mark this appointment as "Paid"?', 'booked'),
+
+diff --git a/booked/includes/add-ons/woocommerce-payments/lib/class-static-functions.php b/booked/includes/add-ons/woocommerce-payments/lib/class-static-functions.php
+--- a/booked/includes/add-ons/woocommerce-payments/lib/class-static-functions.php
++++ b/booked/includes/add-ons/woocommerce-payments/lib/class-static-functions.php
+@@ -546,7 +546,28 @@
+ 			return;
+ 		}
+ 
+-		$appointment = Booked_WC_Appointment::get(intval($app_id));
++		if ( ! is_user_logged_in() ) {
++			echo 'error###' . esc_html__( 'You must be logged in to edit this appointment.', 'booked' );
++			wp_die();
++		}
++
++		$appointment = Booked_WC_Appointment::get( intval( $app_id ) );
++		$appt_owner = ( $appointment && $appointment->post ) ? intval( $appointment->user_id ? $appointment->user_id : $appointment->post->post_author ) : 0;
++
++		if (
++			! $appointment
++			|| ! $appointment->post
++			|| $appointment->post->post_type !== 'booked_appointments'
++			|| $appt_owner <= 0
++			|| (
++				$appt_owner !== get_current_user_id()
++				&& ! booked_user_can_manage_appointment( intval( $app_id ) )
++			)
++		) {
++			echo 'error###' . esc_html__( 'You do not have permission to edit this appointment.', 'booked' );
++			wp_die();
++		}
++
+ 		$current_time = current_time('timestamp');
+ 
+ 		// check if the date has been passed
+@@ -614,15 +635,32 @@
+ 	// see wp_update_post()
+ 	public static function booked_new_appointment_args_on_date_change( $post_args ) {
+ 
+-		$appointment_id = $_POST['app_id'];
+-		$appointment_obj = get_post($appointment_id, ARRAY_A);
+-
+-		if ( !$appointment_obj ) {
++		if ( ! is_user_logged_in() ) {
+ 			return 0;
+ 		}
+ 
++		$appointment_id = intval( $_POST['app_id'] );
++		$appointment_obj = get_post( $appointment_id, ARRAY_A );
++
++		if ( ! $appointment_obj || $appointment_obj['post_type'] !== 'booked_appointments' ) {
++			return 0;
++		}
++
++		$appt_user_meta = intval( get_post_meta( $appointment_id, '_appointment_user', true ) );
++		$appt_owner = $appt_user_meta ? $appt_user_meta : intval( $appointment_obj['post_author'] );
++
++		if (
++			$appt_owner <= 0
++			|| (
++				$appt_owner !== get_current_user_id()
++				&& ! booked_user_can_manage_appointment( $appointment_id )
++			)
++		) {
++			return 0;
++		}
++
+ 		$default_post_status = get_option('booked_new_appointment_default','draft');
+-		$post_args['ID'] = $_POST['app_id'];
++		$post_args['ID'] = $appointment_id;
+ 
+ 		// Escape data pulled from DB.
+ 		$appointment_obj = wp_slash($appointment_obj);
+
+diff --git a/booked/includes/add-ons/woocommerce-payments/lib/class-wp-ajax.php b/booked/includes/add-ons/woocommerce-payments/lib/class-wp-ajax.php
+--- a/booked/includes/add-ons/woocommerce-payments/lib/class-wp-ajax.php
++++ b/booked/includes/add-ons/woocommerce-payments/lib/class-wp-ajax.php
+@@ -41,6 +41,9 @@
+ 		if (empty($_POST['appt_id']) || !current_user_can('manage_booked_options')){
+ 			return;
+ 		}
++		if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['nonce'] ) ), 'booked-wc-nonce' ) ) {
++			wp_die( '', '', array( 'response' => 403 ) );
++		}
+ 
+ 		$appt_id = (int) $_POST['appt_id'];
+ 		$appointment = Booked_WC_Appointment::get($appt_id);
+@@ -60,6 +63,10 @@
+ 	}
+ 
+ 	public function load_product_variations() {
++
++		if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['nonce'] ) ), 'booked-wc-nonce' ) ) {
++			wp_die( '', '', array( 'response' => 403 ) );
++		}
+ 
+ 		if (
+ 			empty($_POST['product_id'])
+@@ -102,6 +109,19 @@
+ 	public function add_appointment_to_cart() {
+ 		$response = new Booked_WC_Response();
+ 
++		if (
++			! isset( $_POST['nonce'] )
++			|| ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['nonce'] ) ), 'booked-wc-nonce' )
++		) {
++			$response->add_message( __( 'Security check failed.', 'booked' ) );
++			$response->create();
++		}
++
++		if ( ! is_user_logged_in() ) {
++			$response->add_message( __( 'You must be logged in to pay for this appointment.', 'booked' ) );
++			$response->create();
++		}
++
+ 		$app_id = (!empty($_POST['app_id']) && $_POST['app_id']) ? intval($_POST['app_id']) : false;
+ 		if ( !$app_id ) {
+ 			$response->add_message(__('Appointment ID is not defined.', 'booked'));
+@@ -110,8 +130,23 @@
+ 
+ 		try {
+ 			$appointment = Booked_WC_Appointment::get($app_id);
++			if ( ! $appointment || ! $appointment->post || $appointment->post->post_type !== 'booked_appointments' ) {
++				$response->add_message( __( 'Invalid appointment.', 'booked' ) );
++				$response->create();
++			}
++			$appt_owner = intval( $appointment->user_id ? $appointment->user_id : $appointment->post->post_author );
++			if (
++				$appt_owner <= 0
++				|| (
++					get_current_user_id() !== $appt_owner
++					&& ! booked_user_can_manage_appointment( $app_id )
++				)
++			) {
++				$response->add_message( __( 'You do not have permission to pay for this appointment.', 'booked' ) );
++				$response->create();
++			}
+ 			if ( !$appointment->products ) {
+-				$response->add_message($e->getMessage());
++				$response->add_message( __( 'Appointment does not have any products assigned to it.', 'booked' ) );
+ 				$response->create();
+ 			}
+ 
+
+diff --git a/booked/includes/admin-functions.php b/booked/includes/admin-functions.php
+--- a/booked/includes/admin-functions.php
++++ b/booked/includes/admin-functions.php
+@@ -621,6 +621,12 @@
+ 
+ function booked_get_admin_appointments($date,$time_format,$date_format,$calendar_id = false,$tabbed = false,$calendars = false){
+ 
++	if ( ! current_user_can( 'manage_booked_options' ) ) {
++		if ( ! $calendar_id || $calendar_id === 'default' || ! booked_user_can_manage_calendar( $calendar_id ) ) {
++			return array();
++		}
++	}
++
+ 	$year = date_i18n('Y',strtotime($date));
+ 	$month = date_i18n('m',strtotime($date));
+ 	$day = date_i18n('d',strtotime($date));
+@@ -649,7 +655,7 @@
+ 				'terms'    => $calendar_id,
+ 			)
+ 		);
+-	elseif (!$calendar_id && $tabbed && !empty($calendars) || $calendar_id = 'default'):
++	elseif (!$calendar_id && $tabbed && !empty($calendars) || $calendar_id == 'default'):
+ 
+ 		$not_in_calendar = array();
+ 
+
+diff --git a/booked/includes/ajax/admin/add-appointment.php b/booked/includes/ajax/admin/add-appointment.php
+--- a/booked/includes/ajax/admin/add-appointment.php
++++ b/booked/includes/ajax/admin/add-appointment.php
+@@ -2,15 +2,32 @@
+ 
+ do_action('booked_before_creating_appointment');
+ 
+-$date = isset($_POST['date']) ? esc_html( $_POST['date'] ) : '';
+-$title = isset($_POST['title']) ? esc_html( $_POST['title'] ) : '';
+-$timestamp = isset($_POST['timestamp']) ? esc_html( $_POST['timestamp'] ) : '';
+-$timeslot = isset($_POST['timeslot']) ? esc_html( $_POST['timeslot'] ) : '';
+-$customer_type = isset($_POST['customer_type']) ? esc_html( $_POST['customer_type'] ) : '';
++$raw_date = isset($_POST['date']) ? sanitize_text_field( wp_unslash( $_POST['date'] ) ) : '';
++$title = isset($_POST['title']) ? sanitize_text_field( wp_unslash( $_POST['title'] ) ) : '';
++$raw_timeslot = isset($_POST['timeslot']) ? sanitize_text_field( wp_unslash( $_POST['timeslot'] ) ) : '';
++$customer_type = isset($_POST['customer_type']) ? sanitize_text_field( wp_unslash( $_POST['customer_type'] ) ) : '';
+ 
+ $hide_end_times = get_option('booked_hide_end_times',false);
+ 
+-$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
++$calendar_id = (isset($_POST['calendar_id']) && $_POST['calendar_id'] !== '' ? intval( $_POST['calendar_id'] ) : false);
++if ( ! booked_user_can_manage_calendar( $calendar_id ) ) {
++	echo 'error###' . esc_html__( 'You do not have permission to manage this calendar.', 'booked' );
++	wp_die();
++}
++$validated_slot = booked_validate_and_build_timestamp( $raw_date, $raw_timeslot );
++if ( ! $validated_slot ) {
++	echo 'error###' . esc_html__( 'Invalid appointment date or time slot.', 'booked' );
++	wp_die();
++}
++$date = $validated_slot['date'];
++$timeslot = $validated_slot['timeslot'];
++$timestamp = $validated_slot['timestamp'];
++
++if ( booked_is_timeslot_disabled( $date, $timeslot, $calendar_id ) ) {
++	echo 'error###' . esc_html__( 'This time slot has been disabled.', 'booked' );
++	wp_die();
++}
++
+ $calendar_id_for_cf = $calendar_id;
+ if ($calendar_id):
+ 	$calendar_id = array($calendar_id);
+@@ -59,12 +76,14 @@
+ 
+ 				$field_value = $_POST[$field_name];
+ 				if (is_array($field_value)){
+-					$field_value = implode(', ',$field_value);
++					$field_value = implode(', ', array_map('sanitize_text_field', wp_unslash($field_value)));
++				} else {
++					$field_value = sanitize_textarea_field( wp_unslash( $field_value ) );
+ 				}
+ 
+ 				$custom_field_data[$key] = array(
+-					'label' => $current_group_name,
+-					'value' => $field_value
++					'label' => esc_html( wp_strip_all_tags( $current_group_name ) ),
++					'value' => esc_html( $field_value )
+ 				);
+ 
+ 			endif;
+@@ -212,7 +231,8 @@
+ 			'user_email'    =>  $email,
+ 			'user_pass'     =>  $password,
+ 			'first_name'	=>	$name,
+-			'last_name'		=>	$surname
++			'last_name'		=>	$surname,
++			'role'          =>  'subscriber'
+         );
+         $user_id = wp_insert_user( $userdata );
+ 
+
+diff --git a/booked/includes/ajax/admin/appointment-form.php b/booked/includes/ajax/admin/appointment-form.php
+--- a/booked/includes/ajax/admin/appointment-form.php
++++ b/booked/includes/ajax/admin/appointment-form.php
+@@ -15,6 +15,9 @@
+ $name_requirements = ( isset($name_requirements[0]) ? $name_requirements[0] : false );
+ 
+ $calendar_id = (isset($_POST['calendar_id']) ? intval($_POST['calendar_id']) : false);
++if ( ! booked_user_can_manage_calendar( $calendar_id ) ) {
++	wp_die( '', '', array( 'response' => 403 ) );
++}
+ if ($calendar_id): $calendar_obj = get_term($calendar_id,'booked_custom_calendars'); $calendar_name = $calendar_obj->name; else: $calendar_name = ''; endif;
+ 
+ if ($timeslot_parts[0] == '0000' && $timeslot_parts[1] == '2400'):
+
+diff --git a/booked/includes/ajax/admin/delete-appointment.php b/booked/includes/ajax/admin/delete-appointment.php
+--- a/booked/includes/ajax/admin/delete-appointment.php
++++ b/booked/includes/ajax/admin/delete-appointment.php
+@@ -1,5 +1,9 @@
+ <?php
+ 
++$appt_id = isset($appt_id) ? intval($appt_id) : 0;
++if ( ! booked_user_can_manage_appointment( $appt_id ) ) {
++	wp_die( '', '', array( 'response' => 403 ) );
++}
+ $timestamp = get_post_meta($appt_id,'_appointment_timestamp',true);
+ $timeslot = get_post_meta($appt_id,'_appointment_timeslot',true);
+ $timeslots = explode('-',$timeslot);
+
+diff --git a/booked/includes/ajax/admin/edit-appointment.php b/booked/includes/ajax/admin/edit-appointment.php
+--- a/booked/includes/ajax/admin/edit-appointment.php
++++ b/booked/includes/ajax/admin/edit-appointment.php
+@@ -2,18 +2,36 @@
+ 
+ do_action('booked_before_editing_appointment');
+ 
+-$appt_id = isset($_POST['appt_id']) ? $_POST['appt_id'] : '';
+-$date = isset($_POST['appt_date']) ? $_POST['appt_date'] : '';
+-$timeslot = isset($_POST['appt_timeslot']) ? $_POST['appt_timeslot'] : '';
+-$first_name = isset($_POST['name']) ? $_POST['name'] : '';
+-$last_name = isset($_POST['surname']) ? $_POST['surname'] : '';
+-$email = isset($_POST['email']) ? $_POST['email'] : '';
+-$phone = isset($_POST['phone']) ? $_POST['phone'] : '';
+-$user_id = (isset($_POST['user_id']) ? $_POST['user_id'] : false);
+-$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
++$appt_id = isset($_POST['appt_id']) ? intval( $_POST['appt_id'] ) : 0;
++$raw_date = isset($_POST['appt_date']) ? sanitize_text_field( wp_unslash( $_POST['appt_date'] ) ) : '';
++$raw_timeslot = isset($_POST['appt_timeslot']) ? sanitize_text_field( wp_unslash( $_POST['appt_timeslot'] ) ) : '';
++$first_name = isset($_POST['name']) ? sanitize_text_field( wp_unslash( $_POST['name'] ) ) : '';
++$last_name = isset($_POST['surname']) ? sanitize_text_field( wp_unslash( $_POST['surname'] ) ) : '';
++$email = isset($_POST['email']) ? sanitize_email( wp_unslash( $_POST['email'] ) ) : '';
++$phone = isset($_POST['phone']) ? sanitize_text_field( wp_unslash( $_POST['phone'] ) ) : '';
++$calendar_id = (isset($_POST['calendar_id']) && $_POST['calendar_id'] !== '' ? intval( $_POST['calendar_id'] ) : false);
+ 
+-$_timeslots = explode( '-', $timeslot );
+-$_timestamp_time = date( 'H:i:s', strtotime( $_timeslots[0] ) );
++if ( ! $appt_id || ! booked_user_can_manage_appointment( $appt_id ) ) {
++	echo 'error###' . esc_html__( 'You do not have permission to edit this appointment.', 'booked' );
++	wp_die();
++}
++if ( $calendar_id && ! booked_user_can_manage_calendar( $calendar_id ) ) {
++	echo 'error###' . esc_html__( 'You do not have permission to manage this calendar.', 'booked' );
++	wp_die();
++}
++
++$validated_slot = booked_validate_and_build_timestamp( $raw_date, $raw_timeslot );
++if ( ! $validated_slot ) {
++	echo 'error###' . esc_html__( 'Invalid appointment date or time slot.', 'booked' );
++	wp_die();
++}
++$date = $validated_slot['date'];
++$timeslot = $validated_slot['timeslot'];
++$timestamp = $validated_slot['timestamp'];
++
++// Always bind $user_id to the appointment's actual customer rather than trusting $_POST['user_id']
++$appt_user_id = intval( get_post_meta( $appt_id, '_appointment_user', true ) );
++$user_id = ( ! empty( $_POST['user_id'] ) && $appt_user_id && intval( $_POST['user_id'] ) === $appt_user_id ) ? $appt_user_id : false;
+ 
+ if ( $appt_id ):
+ 
+@@ -33,7 +51,6 @@
+ 
+ 	$booked_defaults = booked_apply_custom_timeslots_filter($booked_defaults,$calendar_id);
+ 
+-	$timestamp = strtotime( date_i18n('Y-m-d', strtotime($date) ) . ' ' . $_timestamp_time );
+ 	$day = date('D',strtotime($date));
+ 	$title = isset($booked_defaults[$day.'-details'][$timeslot]['title']) ? $booked_defaults[$day.'-details'][$timeslot]['title'] : '';
+ 
+@@ -53,9 +70,21 @@
+ 		update_post_meta( $appt_id, '_appointment_timestamp', $timestamp );
+ 		update_post_meta( $appt_id, '_appointment_timeslot', $timeslot );
+ 
+-		if ( !user_can( $user_id, 'manage_options' ) ):
+-			update_user_meta( $user_id, 'booked_phone', $phone );
+-			wp_update_user( array( 'ID' => $user_id, 'first_name' => $first_name, 'last_name' => $last_name, 'user_email' => $email, 'user_login' => $email, 'display_name' => $first_name . ( $last_name ? ' ' . $last_name : '' ) ) );
++		if ( current_user_can( 'edit_user', $user_id ) && ! user_can( $user_id, 'manage_options' ) && ! user_can( $user_id, 'edit_booked_appointments' ) ):
++			$existing_email_owner = $email ? email_exists( $email ) : false;
++			if ( ! $existing_email_owner || intval( $existing_email_owner ) === intval( $user_id ) ) {
++				update_user_meta( $user_id, 'booked_phone', $phone );
++				$update_args = array(
++					'ID'           => $user_id,
++					'first_name'   => $first_name,
++					'last_name'    => $last_name,
++					'display_name' => $first_name . ( $last_name ? ' ' . $last_name : '' ),
++				);
++				if ( $email ) {
++					$update_args['user_email'] = $email;
++				}
++				wp_update_user( $update_args );
++			}
+ 		endif;
+ 
+ 	endif;
+
+diff --git a/booked/includes/ajax/admin/user-info.php b/booked/includes/ajax/admin/user-info.php
+--- a/booked/includes/ajax/admin/user-info.php
++++ b/booked/includes/ajax/admin/user-info.php
+@@ -4,23 +4,24 @@
+ 
+ 	echo '<p class="booked-title-bar"><small>'.esc_html__('Edit Appointment','booked').'</small></p>';
+ 
+-	$appt_id = ( isset($_POST['appt_id']) ? esc_html( $_POST['appt_id'] ) : false );
++	$appt_id = ( isset($_POST['appt_id']) ? intval( $_POST['appt_id'] ) : false );
++	if ( ! $appt_id || ! booked_user_can_manage_appointment( $appt_id ) ) {
++		wp_die( '', '', array( 'response' => 403 ) );
++	}
++	$calendar_id = false;
++	$calendars = get_the_terms( $appt_id, 'booked_custom_calendars' );
++	if ( !empty($calendars) && !is_wp_error($calendars) ):
++		foreach( $calendars as $calendar ):
++			$calendar_id = $calendar->term_id;
++		endforeach;
++	endif;
+ 
+-	?><form action="" method="post" class="booked-form" id="editAppointmentForm" data-appt-id="<?php echo $appt_id; ?>"<?php if ($calendar_id): echo ' data-calendar-id="'.$calendar_id.'"'; endif; ?>><?php
++	?><form action="" method="post" class="booked-form" id="editAppointmentForm" data-appt-id="<?php echo esc_attr( $appt_id ); ?>"<?php if ($calendar_id): echo ' data-calendar-id="'.esc_attr($calendar_id).'"'; endif; ?>><?php
+ 		
+ 		wp_nonce_field( 'ajax-admin-edit-appt-nonce', 'nonce' );
+ 
+-		$calendars = get_the_terms( $appt_id, 'booked_custom_calendars' );
+-		if ( !empty($calendars) ):
+-			foreach( $calendars as $calendar ):
+-				$calendar_id = $calendar->term_id;
+-			endforeach;
+-		else:
+-			$calendar_id = false;
+-		endif;
+-
+ 		$_appt = get_post( $appt_id );
+-		$user_id = ( isset($_POST['user_id']) ? esc_html( $_POST['user_id'] ) : false );
++		$user_id = intval( get_post_meta( $appt_id, '_appointment_user', true ) );
+ 
+ 		if ( $appt_id ):
+ 
+@@ -86,22 +87,22 @@
+ 
+ 			if (isset($name_requirements[0]) && $name_requirements[0] == 'require_surname'): ?>
+ 				<div class="field">
+-					<input value="<?php echo $first_name; ?>" placeholder="<?php esc_html_e('First Name','booked'); ?>..." type="text" class="textfield" name="name"<?php if ( $user_id && user_can( $user_id, 'manage_options' ) ):
++					<input value="<?php echo esc_attr( $first_name ); ?>" placeholder="<?php esc_html_e('First Name','booked'); ?>..." type="text" class="textfield" name="name"<?php if ( $user_id && ( ! current_user_can( 'edit_user', $user_id ) || user_can( $user_id, 'manage_options' ) ) ):
+ 						echo ' readonly="true"';
+ 					endif; ?> />
+-					<input value="<?php echo $last_name; ?>" placeholder="<?php esc_html_e('Last Name','booked'); ?>..." type="text" class="textfield" name="surname"<?php if ( $user_id && user_can( $user_id, 'manage_options' ) ):
++					<input value="<?php echo esc_attr( $last_name ); ?>" placeholder="<?php esc_html_e('Last Name','booked'); ?>..." type="text" class="textfield" name="surname"<?php if ( $user_id && ( ! current_user_can( 'edit_user', $user_id ) || user_can( $user_id, 'manage_options' ) ) ):
+ 						echo ' readonly="true"';
+ 					endif; ?> />
+ 				</div>
+ 			<?php else: ?>
+ 				<div class="field">
+ 					<input
+-						value="<?php echo $first_name . ( $last_name ? ' ' . $last_name : '' ); ?>"
++						value="<?php echo esc_attr( $first_name . ( $last_name ? ' ' . $last_name : '' ) ); ?>"
+ 						placeholder="<?php esc_html_e('Name','booked'); ?>..."
+ 						type="text"
+ 						class="large textfield"
+ 						name="name"<?php
+-						if ( $user_id && user_can( $user_id, 'manage_options' ) ):
++						if ( $user_id && ( ! current_user_can( 'edit_user', $user_id ) || user_can( $user_id, 'manage_options' ) ) ):
+ 							echo ' readonly="true"';
+ 						endif;
+ 					?> />
+@@ -111,22 +112,22 @@
+ 			if ($customer_email):
+ 				?><div class="field">
+ 					<input
+-						value="<?php echo $customer_email; ?>"
++						value="<?php echo esc_attr( $customer_email ); ?>"
+ 						placeholder="<?php esc_html_e('Email Address','booked'); ?>..."
+ 						type="email"
+ 						class="large textfield"
+ 						name="email"<?php
+-						if ( $user_id && user_can( $user_id, 'manage_options' ) ):
++						if ( $user_id && ( ! current_user_can( 'edit_user', $user_id ) || user_can( $user_id, 'manage_options' ) ) ):
+ 							echo ' readonly="true"';
+ 						endif;
+ 					?> />
+ 				</div><?php
+ 			endif;
+ 
+-			if ($customer_phone):
++			if (isset($customer_phone) && $customer_phone):
+ 				?><div class="field">
+-					<input value="<?php echo $customer_phone; ?>" placeholder="<?php esc_html_e('Phone Number','booked'); ?>..." type="tel" class="large textfield" name="phone"<?php
+-						if ( $user_id && user_can( $user_id, 'manage_options' ) ):
++					<input value="<?php echo esc_attr( $customer_phone ); ?>" placeholder="<?php esc_html_e('Phone Number','booked'); ?>..." type="tel" class="large textfield" name="phone"<?php
++						if ( $user_id && ( ! current_user_can( 'edit_user', $user_id ) || user_can( $user_id, 'manage_options' ) ) ):
+ 							echo ' readonly="true"';
+ 						endif;
+ 					?> />
+@@ -140,7 +141,7 @@
+ 				?><p class="booked-calendar-name"><?php esc_html_e( 'Appointment Information', 'booked' ); ?></p><?php
+ 	
+ 				do_action('booked_before_appointment_information_admin');
+-				echo ( $cf_meta_value ? '<div class="cf-meta-values">'.$cf_meta_value.'</div>' : '');
++				echo ( $cf_meta_value ? '<div class="cf-meta-values">'.wp_kses_post($cf_meta_value).'</div>' : '');
+ 				do_action('booked_after_appointment_information_admin');
+ 				
+ 			endif;
+@@ -148,9 +149,9 @@
+ 			echo '<hr />';
+ 
+ 			?><input type="hidden" name="action" value="booked_admin_edit_appt" />
+-			<input type="hidden" name="user_id" value="<?php echo $user_id; ?>" />
+-			<input type="hidden" name="appt_id" value="<?php echo $appt_id; ?>" />
+-			<input type="hidden" name="calendar_id" value="<?php echo $calendar_id; ?>" /><?php
++			<input type="hidden" name="user_id" value="<?php echo esc_attr( $user_id ); ?>" />
++			<input type="hidden" name="appt_id" value="<?php echo esc_attr( $appt_id ); ?>" />
++			<input type="hidden" name="calendar_id" value="<?php echo esc_attr( $calendar_id ); ?>" /><?php
+ 
+ 			?><div class="field">
+ 				<input type="submit" class="button button-primary" value="<?php esc_html_e('Update Appointment','booked'); ?>">
+
+diff --git a/booked/includes/ajax/front/appointment-form.php b/booked/includes/ajax/front/appointment-form.php
+--- a/booked/includes/ajax/front/appointment-form.php
++++ b/booked/includes/ajax/front/appointment-form.php
+@@ -1,16 +1,30 @@
+-<?php // Release BBF898CAA2EBDF8AFA2AF8F5
++<?php
+ 
+ $bookings = array();
+ 
+-if ( ! empty( $_POST['calendars'] ) ) {
+-	$bookings = $_POST['calendars'];
++if ( ! empty( $_POST['calendars'] ) && is_array( $_POST['calendars'] ) ) {
++	foreach ( $_POST['calendars'] as $cal_key => $cal_appts ) {
++		$clean_cal_id = intval( $cal_key );
++		if ( is_array( $cal_appts ) ) {
++			foreach ( $cal_appts as $appt_item ) {
++				if ( is_array( $appt_item ) ) {
++					$bookings[ $clean_cal_id ][] = array(
++						'date'        => isset( $appt_item['date'] ) ? sanitize_text_field( wp_unslash( $appt_item['date'] ) ) : '',
++						'title'       => isset( $appt_item['title'] ) ? sanitize_text_field( wp_unslash( $appt_item['title'] ) ) : '',
++						'timeslot'    => isset( $appt_item['timeslot'] ) ? sanitize_text_field( wp_unslash( $appt_item['timeslot'] ) ) : '',
++						'calendar_id' => $clean_cal_id,
++					);
++				}
++			}
++		}
++	}
+ } else {
+ 	$calendar_id = isset( $_POST['calendar_id'] ) ? intval( $_POST['calendar_id'] ) : false;
+ 	$bookings[ $calendar_id ][] = array(
+-		'date' => isset( $_POST['date'] ) ? esc_html( $_POST['date'] ) : '',
+-        'title' => isset( $_POST['title'] ) ? esc_html( $_POST['title'] ) : '',
+-        'timeslot' => isset( $_POST['timeslot'] ) ? esc_html( $_POST['timeslot'] ) : '',
+-        'calendar_id' => $calendar_id,
++		'date'        => isset( $_POST['date'] ) ? sanitize_text_field( wp_unslash( $_POST['date'] ) ) : '',
++		'title'       => isset( $_POST['title'] ) ? sanitize_text_field( wp_unslash( $_POST['title'] ) ) : '',
++		'timeslot'    => isset( $_POST['timeslot'] ) ? sanitize_text_field( wp_unslash( $_POST['timeslot'] ) ) : '',
++		'calendar_id' => $calendar_id,
+ 	);
+ }
+ 
+
+diff --git a/booked/includes/ajax/front/appointment-form/appointment.php b/booked/includes/ajax/front/appointment-form/appointment.php
+--- a/booked/includes/ajax/front/appointment-form/appointment.php
++++ b/booked/includes/ajax/front/appointment-form/appointment.php
+@@ -33,12 +33,12 @@
+ 	}
+ }
+ 
+-if (!empty($calendar_id)): $calendar_term = get_term_by('id',$calendar_id,'booked_custom_calendars'); $calendar_name = '<p class="calendar-name">' . $calendar_term->name . '</p>'; else: $calendar_name = false; endif;
+-$appt_title = $title ? '<p class="appointment-title">' . $title . '</p>' : '';
++if (!empty($calendar_id)): $calendar_term = get_term_by('id',$calendar_id,'booked_custom_calendars'); $calendar_name = ( $calendar_term && ! is_wp_error( $calendar_term ) ? '<p class="calendar-name">' . esc_html( $calendar_term->name ) . '</p>' : false ); else: $calendar_name = false; endif;
++$appt_title = $title ? '<p class="appointment-title">' . esc_html( $title ) . '</p>' : '';
+ $appt_timeslot = $timeslotText ? $timeslotText : '';
+ $appt_date_name = date_i18n( $date_format, strtotime( $date ) );
+ 
+-?><div class="booked-appointment-details" data-appt-key="<?php echo $appointment_key; ?>"><?php
++?><div class="booked-appointment-details" data-appt-key="<?php echo esc_attr( $appointment_key ); ?>"><?php
+ 
+ 	echo $appt_date_time_before;
+ 	echo $appt_title;
+@@ -56,12 +56,12 @@
+ 
+ 	echo $appt_date_time_after;
+ 
+-	?><input type="hidden" name="appoinment[]" value="<?php echo $appointment_counter; ?>" />
+-	<input type="hidden" name="appoinment_index[]" value="<?php echo $appointment_key; ?>" />
++	?><input type="hidden" name="appoinment[]" value="<?php echo esc_attr( $appointment_counter ); ?>" />
++	<input type="hidden" name="appoinment_index[]" value="<?php echo esc_attr( $appointment_key ); ?>" />
+ 	<input type="hidden" name="calendar_id[]" value="<?php echo intval($calendar_id); ?>" />
+ 	<input type="hidden" name="title[]" value="<?php echo esc_attr( $title ); ?>" />
+-	<input type="hidden" name="date[]" value="<?php echo date_i18n( 'Y-m-j', strtotime( $date ) ); ?>" />
+-	<input type="hidden" name="timestamp[]" value="<?php echo $timestamp; ?>" />
+-	<input type="hidden" name="timeslot[]" value="<?php echo $timeslot; ?>" />
++	<input type="hidden" name="date[]" value="<?php echo esc_attr( date_i18n( 'Y-m-j', strtotime( $date ) ) ); ?>" />
++	<input type="hidden" name="timestamp[]" value="<?php echo esc_attr( $timestamp ); ?>" />
++	<input type="hidden" name="timeslot[]" value="<?php echo esc_attr( $timeslot ); ?>" />
+ 
+ </div>
+
+diff --git a/booked/includes/ajax/front/appointment-form/form.php b/booked/includes/ajax/front/appointment-form/form.php
+--- a/booked/includes/ajax/front/appointment-form/form.php
++++ b/booked/includes/ajax/front/appointment-form/form.php
+@@ -59,7 +59,7 @@
+ 		$first_booking = array_shift( $tmp_bookings );
+ 		$first_booking = ! empty($first_booking) ? $first_booking[0] : array( 'date' => '', 'title' => '', 'timeslot' => '', 'calendar_id' => '' );
+ 		?>
+-		<form id="ajaxlogin" action="" method="post" data-date="<?php echo $first_booking['date']; ?>" data-title="<?php echo $first_booking['title']; ?>" data-timeslot="<?php echo $first_booking['timeslot']; ?>" data-calendar-id="<?php echo $first_booking['calendar_id']; ?>">
++		<form id="ajaxlogin" action="" method="post" data-date="<?php echo esc_attr( $first_booking['date'] ); ?>" data-title="<?php echo esc_attr( $first_booking['title'] ); ?>" data-timeslot="<?php echo esc_attr( $first_booking['timeslot'] ); ?>" data-calendar-id="<?php echo esc_attr( $first_booking['calendar_id'] ); ?>">
+ 			<div class="cf-block">
+ 
+ 				<?php include(BOOKED_AJAX_INCLUDES_DIR . 'front/appointment-form/form-fields-login.php'); ?>
+
+diff --git a/booked/includes/ajax/front/book-appointment.php b/booked/includes/ajax/front/book-appointment.php
+--- a/booked/includes/ajax/front/book-appointment.php
++++ b/booked/includes/ajax/front/book-appointment.php
+@@ -2,13 +2,12 @@
+ 
+ do_action('booked_before_creating_appointment');
+ 
+-$date = isset($_POST['date']) ? esc_html( $_POST['date'] ) : '';
+-$title = isset($_POST['title']) ? esc_html( $_POST['title'] ) : '';
+-$timestamp = isset($_POST['timestamp']) ? esc_html( $_POST['timestamp'] ) : '';
+-$timeslot = isset($_POST['timeslot']) ? esc_html( $_POST['timeslot'] ) : '';
+-$customer_type = isset($_POST['customer_type']) ? esc_html( $_POST['customer_type'] ) : '';
+-
+-$calendar_id = (isset($_POST['calendar_id']) ? esc_html( $_POST['calendar_id'] ) : false);
++$raw_date = isset($_POST['date']) ? sanitize_text_field( wp_unslash( $_POST['date'] ) ) : '';
++$title = isset($_POST['title']) ? sanitize_text_field( wp_unslash( $_POST['title'] ) ) : '';
++$raw_timeslot = isset($_POST['timeslot']) ? sanitize_text_field( wp_unslash( $_POST['timeslot'] ) ) : '';
++$customer_type = isset($_POST['customer_type']) ? sanitize_text_field( wp_unslash( $_POST['customer_type'] ) ) : '';
++
++$calendar_id = (isset($_POST['calendar_id']) && $_POST['calendar_id'] !== '' ? intval( $_POST['calendar_id'] ) : false);
+ $calendar_id_for_cf = $calendar_id;
+ if ($calendar_id):
+ 	$calendar_id = array($calendar_id);
+@@ -20,9 +19,26 @@
+ $name_requirements = ( isset($name_requirements[0]) ? $name_requirements[0] : false );
+ $is_new_registration = $customer_type == 'new' && ! isset($_POST['date']) && ! isset($_POST['timestamp']) && ! isset($_POST['timeslot']);
+ 
+-if ( !$is_new_registration && $date && $timeslot && isset($calendar_id_for_cf) ):
++if ( !$is_new_registration && $raw_date && $raw_timeslot && isset($calendar_id_for_cf) ):
++
++	$validated_slot = booked_validate_and_build_timestamp( $raw_date, $raw_timeslot );
++	if ( ! $validated_slot ) {
++		echo 'error###' . esc_html__( 'Invalid appointment date or time slot.', 'booked' );
++		wp_die();
++	}
++	$date = $validated_slot['date'];
++	$timeslot = $validated_slot['timeslot'];
++	// Always use the server-computed timestamp instead of trusting $_POST['timestamp']
++	$timestamp = $validated_slot['timestamp'];
++	$_POST['date'] = $date;
++	$_POST['timeslot'] = $timeslot;
++	$_POST['timestamp'] = $timestamp;
+ 
+ 	$appt_is_available = booked_appt_is_available($date,$timeslot,$calendar_id_for_cf);
++
++elseif ( $is_new_registration ):
++
++	$appt_is_available = false;
+ 
+ else:
+ 
+@@ -75,12 +91,14 @@
+ 
+ 					$field_value = $_POST[$field_name];
+ 					if (is_array($field_value)){
+-						$field_value = implode(', ',$field_value);
++						$field_value = implode(', ', array_map('sanitize_text_field', wp_unslash($field_value)));
++					} else {
++						$field_value = sanitize_textarea_field( wp_unslash( $field_value ) );
+ 					}
+ 
+ 					$custom_field_data[$key] = array(
+-						'label' => $current_group_name,
+-						'value' => $field_value
++						'label' => esc_html( wp_strip_all_tags( $current_group_name ) ),
++						'value' => esc_html( $field_value )
+ 					);
+ 
+ 				endif;
+@@ -104,7 +122,12 @@
+ 
+ 	if ($customer_type == 'guest'):
+ 
+-		$name = esc_attr($_POST['guest_name']);
++		if ( get_option( 'booked_booking_type', 'registered' ) !== 'guest' ) {
++			echo 'error###' . esc_html__( 'Guest booking is not enabled.', 'booked' );
++			wp_die();
++		}
++
++		$name = sanitize_text_field( wp_unslash( $_POST['guest_name'] ) );
+ 		$surname = isset($_POST['guest_surname']) && $_POST['guest_surname'] ? esc_attr($_POST['guest_surname']) : false;
+ 		$fullname = ( $surname ? $name . ' ' . $surname : $name );
+ 		$email = isset($_POST['guest_email']) ? esc_attr($_POST['guest_email']) : '';
+@@ -197,10 +220,23 @@
+ 
+ 	elseif ($customer_type == 'current'):
+ 
+-		$user_id = ! empty($_POST['user_id']) ? intval($_POST['user_id']) : false;
+-		if ( ! $user_id && is_user_logged_in() ) {
+-			$user = wp_get_current_user();
+-			$user_id = $user->ID;
++		if ( ! is_user_logged_in() ) {
++			echo 'error###' . esc_html__( 'You must be logged in to book an appointment.', 'booked' );
++			wp_die();
++		}
++		$user = wp_get_current_user();
++		$user_id = $user->ID;
++		if ( ! empty( $_POST['user_id'] ) && intval( $_POST['user_id'] ) !== intval( $user_id ) && ! current_user_can( 'edit_booked_appointments' ) ) {
++			echo 'error###' . esc_html__( 'Unauthorized user ID.', 'booked' );
++			wp_die();
++		}
++		$appointment_limit = intval( get_option( 'booked_appointment_limit', 0 ) );
++		if ( $appointment_limit > 0 ) {
++			$upcoming_user_appointments = booked_user_appointments( $user_id, true );
++			if ( $upcoming_user_appointments >= $appointment_limit ) {
++				echo 'error###' . sprintf( _n( "Sorry, but you've hit the appointment limit. Each user may only book %d appointment at a time.", "Sorry, but you've hit the appointment limit. Each user may only book %d appointments at a time.", $appointment_limit, 'booked' ), $appointment_limit );
++				wp_die();
++			}
+ 		}
+ 
+ 		// Create a new appointment post for a current customer
+@@ -269,10 +305,15 @@
+ 
+ 	elseif ($customer_type == 'new'):
+ 
+-		$name = esc_attr($_POST['booked_appt_name']);
+-		$surname = ( isset($_POST['booked_appt_surname']) && $_POST['booked_appt_surname'] ? esc_attr($_POST['booked_appt_surname']) : false );
++		if ( ! get_option( 'users_can_register' ) ) {
++			echo 'error###' . esc_html__( 'User registration is currently disabled.', 'booked' );
++			wp_die();
++		}
++
++		$name = sanitize_text_field( wp_unslash( $_POST['booked_appt_name'] ) );
++		$surname = ( isset($_POST['booked_appt_surname']) && $_POST['booked_appt_surname'] ? sanitize_text_field( wp_unslash( $_POST['booked_appt_surname'] ) ) : false );
+ 		$fullname = ( $surname ? $name . ' ' . $surname : $name );
+-		$email = $_POST['booked_appt_email'];
++		$email = sanitize_email( wp_unslash( $_POST['booked_appt_email'] ) );
+ 		$password = $_POST['booked_appt_password'];
+ 
+ 		if ( $name_requirements == 'require_surname' && !$surname ):
+@@ -298,7 +339,8 @@
+ 					'user_email'    =>  $email,
+ 					'user_pass'     =>  $password,
+ 					'first_name'	=>	$name,
+-					'last_name'		=>	$surname
++					'last_name'		=>	$surname,
++					'role'          =>  'subscriber'
+ 		        );
+ 		        $user_id = wp_insert_user( $userdata );
+ 
+@@ -418,10 +460,15 @@
+ // register the user only
+ elseif ( $is_new_registration ):
+ 
+-	$name = esc_attr($_POST['booked_appt_name']);
+-	$surname = ( isset($_POST['booked_appt_surname']) && $_POST['booked_appt_surname'] ? esc_attr($_POST['booked_appt_surname']) : false );
++	if ( ! get_option( 'users_can_register' ) ) {
++		echo 'error###' . esc_html__( 'User registration is currently disabled.', 'booked' );
++		wp_die();
++	}
++
++	$name = sanitize_text_field( wp_unslash( $_POST['booked_appt_name'] ) );
++	$surname = ( isset($_POST['booked_appt_surname']) && $_POST['booked_appt_surname'] ? sanitize_text_field( wp_unslash( $_POST['booked_appt_surname'] ) ) : false );
+ 	$fullname = ( $surname ? $name . ' ' . $surname : $name );
+-	$email = $_POST['booked_appt_email'];
++	$email = sanitize_email( wp_unslash( $_POST['booked_appt_email'] ) );
+ 	$password = $_POST['booked_appt_password'];
+ 
+ 	if ( $name_requirements == 'require_surname' && !$surname ):
+@@ -447,7 +494,8 @@
+ 				'user_email'    =>  $email,
+ 				'user_pass'     =>  $password,
+ 				'first_name'	=>	$name,
+-				'last_name'		=>	$surname
++				'last_name'		=>	$surname,
++				'role'          =>  'subscriber'
+ 	        );
+ 	        $user_id = wp_insert_user( $userdata );
+ 
+
+diff --git a/booked/includes/ajax/front/cancel-appointment.php b/booked/includes/ajax/front/cancel-appointment.php
+--- a/booked/includes/ajax/front/cancel-appointment.php
++++ b/booked/includes/ajax/front/cancel-appointment.php
+@@ -1,9 +1,13 @@
+ <?php
+ 
+-$appt_id = esc_html( $_POST['appt_id'] );
++$appt_id = intval( $_POST['appt_id'] );
+ $appt = get_post( $appt_id );
++if ( ! is_user_logged_in() || ! $appt || $appt->post_type !== 'booked_appointments' || get_option( 'booked_dont_allow_user_cancellations', false ) ) {
++	wp_die();
++}
+ $calendar_id = wp_get_post_terms( $appt_id, 'booked_custom_calendars' );
+-$appt_author = $appt->post_author;
++$appt_user_meta = intval( get_post_meta( $appt_id, '_appointment_user', true ) );
++$appt_author = $appt_user_meta ? $appt_user_meta : intval( $appt->post_author );
+ 
+ $timeslot = get_post_meta( $appt_id,'_appointment_timeslot',true);
+ $timestamp = get_post_meta( $appt_id,'_appointment_timestamp',true);
+@@ -11,7 +15,7 @@
+ $timestamp_start = strtotime(date_i18n('Y-m-d',$timestamp).' '.$timeslots[0]);
+ $current_timestamp = current_time('timestamp');
+ 
+-if (get_current_user_id() == $appt_author):
++if ( $appt_author > 0 && get_current_user_id() === $appt_author ):
+ 
+ 	if ( $timestamp_start >= $current_timestamp ):
+ 
+
+diff --git a/booked/includes/ajax/init.php b/booked/includes/ajax/init.php
+--- a/booked/includes/ajax/init.php
++++ b/booked/includes/ajax/init.php
+@@ -42,7 +42,7 @@
+ 		}
+ 		
+ 		public static function nonce_check( $nonce ){
+-			if ( !wp_verify_nonce( $_POST['nonce'], $nonce ) ){
++			if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], $nonce ) ){
+ 				die ( 'Required "nonce" value is not here, please let the developer know.');
+ 			}
+ 		}
+@@ -59,9 +59,10 @@
+ 
+ 			if (isset($_POST['gotoMonth'])):
+ 
+-				$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
+-				$force_default = (isset($_POST['force_default']) ? $_POST['force_default'] : false);
+-				$timestamp = ($_POST['gotoMonth'] != 'false' ? strtotime($_POST['gotoMonth']) : current_time('timestamp'));
++				$calendar_id = (isset($_POST['calendar_id']) && $_POST['calendar_id'] !== 'false' ? intval($_POST['calendar_id']) : false);
++				$force_default = (isset($_POST['force_default']) && $_POST['force_default'] !== 'false' ? sanitize_text_field( wp_unslash( $_POST['force_default'] ) ) : false);
++				$goto_month = sanitize_text_field( wp_unslash( $_POST['gotoMonth'] ) );
++				$timestamp = ($goto_month != 'false' && strtotime($goto_month) ? strtotime($goto_month) : current_time('timestamp'));
+ 
+ 				$year = date_i18n('Y',$timestamp);
+ 				$month = date_i18n('m',$timestamp);
+@@ -82,8 +83,10 @@
+ 
+ 			if (isset($_POST['date'])):
+ 
+-				$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
+-				booked_fe_calendar_date_content($_POST['date'],$calendar_id);
++				$calendar_id = (isset($_POST['calendar_id']) && $_POST['calendar_id'] !== 'false' ? intval($_POST['calendar_id']) : false);
++				$raw_date = sanitize_text_field( wp_unslash( $_POST['date'] ) );
++				$clean_date = strtotime( $raw_date ) ? date( 'Y-m-d', strtotime( $raw_date ) ) : date_i18n( 'Y-m-d' );
++				booked_fe_calendar_date_content($clean_date,$calendar_id);
+ 
+ 			endif;
+ 			wp_die();
+@@ -99,9 +102,10 @@
+ 
+ 			if (isset($_POST['date'])):
+ 
+-				$date = date_i18n('Ymd',strtotime($_POST['date']));
+-				$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
+-				$force_default = (isset($_POST['force_default']) ? $_POST['force_default'] : false);
++				$raw_date = sanitize_text_field( wp_unslash( $_POST['date'] ) );
++				$date = strtotime( $raw_date ) ? date_i18n( 'Ymd', strtotime( $raw_date ) ) : date_i18n( 'Ymd' );
++				$calendar_id = (isset($_POST['calendar_id']) && $_POST['calendar_id'] !== 'false' ? intval($_POST['calendar_id']) : false);
++				$force_default = (isset($_POST['force_default']) && $_POST['force_default'] !== 'false' ? sanitize_text_field( wp_unslash( $_POST['force_default'] ) ) : false);
+ 
+ 				booked_fe_appointment_list_content($date,$calendar_id,$force_default);
+ 
+@@ -147,18 +151,17 @@
+ 						$user = get_user_by('login', $_POST['username']);
+ 				    }
+ 
+-				    $creds = array();
+-
+-				    if ($user && wp_check_password( $_POST['password'], $user->data->user_pass, $user->ID)) {
+-				        $creds = array('user_login' => $user->data->user_login, 'user_password' => $_POST['password']);
+-				        $creds['remember'] = true;
++				    if ( $user && wp_check_password( $_POST['password'], $user->data->user_pass, $user->ID ) ) {
++				        $creds = array(
++				            'user_login'    => $user->data->user_login,
++				            'user_password' => $_POST['password'],
++				            'remember'      => true,
++				        );
++				        $signed_user = wp_signon( $creds, is_ssl() );
++				        if ( ! is_wp_error( $signed_user ) ):
++				            echo 'success';
++				        endif;
+ 				    }
+-
+-					$user = wp_signon( $creds, false );
+-
+-					if ( !is_wp_error($user) ):
+-						echo 'success';
+-					endif;
+ 
+ 				}
+ 
+
+diff --git a/booked/includes/ajax/init_admin.php b/booked/includes/ajax/init_admin.php
+--- a/booked/includes/ajax/init_admin.php
++++ b/booked/includes/ajax/init_admin.php
+@@ -48,8 +48,20 @@
+ 		
+ 		
+ 		public static function nonce_check( $nonce ){
+-			if ( !wp_verify_nonce( $_POST['nonce'], $nonce ) ){
++			if ( ! current_user_can( 'edit_booked_appointments' ) || ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], $nonce ) ){
+ 				die ( 'Required "nonce" value is not here, please let the developer know.');
++			}
++		}
++
++		public static function verify_calendar_access( $calendar_id = false ) {
++			if ( ! booked_user_can_manage_calendar( $calendar_id ) ) {
++				wp_die( '', '', array( 'response' => 403 ) );
++			}
++		}
++
++		public static function verify_appointment_access( $appt_id = 0 ) {
++			if ( ! booked_user_can_manage_appointment( $appt_id ) ) {
++				wp_die( '', '', array( 'response' => 403 ) );
+ 			}
+ 		}
+ 
+@@ -66,7 +78,8 @@
+ 			$date = esc_html( $_POST['date'] );
+ 			$date = date( 'Y-m-d', strtotime( $date ) );
+ 			$timeslot = esc_html( $_POST['timeslot'] );
+-			$calendar_id = esc_html( $_POST['calendar_id'] );
++			$calendar_id = isset( $_POST['calendar_id'] ) ? esc_html( $_POST['calendar_id'] ) : false;
++			self::verify_calendar_access( $calendar_id );
+ 
+ 			$disabled_timeslots = get_option( 'booked_disabled_timeslots', array() );
+ 
+@@ -120,6 +133,7 @@
+ 
+ 			if (isset($_POST['date']) && isset($_POST['timestamp']) && isset($_POST['timeslot']) && isset($_POST['customer_type'])):
+ 
++				self::verify_calendar_access( isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false );
+ 				include(BOOKED_AJAX_INCLUDES_DIR . 'admin/add-appointment.php');
+ 
+ 			endif;
+@@ -134,6 +148,11 @@
+ 			booked_wpml_ajax();
+ 
+ 			if ( is_user_logged_in() && current_user_can( 'edit_booked_appointments' ) ):
++
++				self::verify_appointment_access( isset($_POST['appt_id']) ? $_POST['appt_id'] : 0 );
++				if ( ! empty( $_POST['calendar_id'] ) ) {
++					self::verify_calendar_access( $_POST['calendar_id'] );
++				}
+ 
+ 				$email_required = get_option('booked_require_guest_email_address',false);
+ 
+@@ -165,6 +184,7 @@
+ 			booked_wpml_ajax();
+ 
+ 			if (isset($_POST['timeslot']) && isset($_POST['currentArray'])):
++				self::verify_calendar_access( isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false );
+ 
+ 				$timeslot_to_delete = $_POST['timeslot'];
+ 				$current_times = json_decode(stripslashes($_POST['currentArray']),true);
+@@ -193,6 +213,12 @@
+ 			Booked_Admin_AJAX::nonce_check('ajax-admin-nonce');
+ 
+ 			booked_wpml_ajax();
++
++			if ( isset($_POST['calendar_id']) ) {
++				self::verify_calendar_access( $_POST['calendar_id'] );
++			} elseif ( ! current_user_can( 'manage_booked_options' ) && empty( booked_get_agent_calendar_ids() ) ) {
++				wp_die( '', '', array( 'response' => 403 ) );
++			}
+ 
+ 			if (isset($_POST['currentArray']) && isset($_POST['timeslot']) && isset($_POST['newCount'])):
+ 
+@@ -228,6 +254,7 @@
+ 			booked_wpml_ajax();
+ 
+ 			if (isset($_POST['startTime']) && isset($_POST['endTime']) && isset($_POST['count']) && isset($_POST['currentTimes'])):
++				self::verify_calendar_access( isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false );
+ 
+ 				$title = isset($_POST['title']) ? $_POST['title'] : '';
+ 				$startTime = $_POST['startTime'];
+@@ -269,6 +296,7 @@
+ 			booked_wpml_ajax();
+ 
+ 			if (isset($_POST['startTime']) && isset($_POST['endTime']) && isset($_POST['interval']) && isset($_POST['count']) && isset($_POST['time_between'])):
++				self::verify_calendar_access( isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false );
+ 				$title = isset($_POST['title']) ? $_POST['title'] : '';
+ 
+ 				$startTime = $_POST['startTime'];
+@@ -328,8 +356,50 @@
+ 
+ 			if (isset($_POST['custom_timeslots_encoded'])):
+ 
+-				$custom_timeslots_encoded = htmlentities( stripslashes($_POST['custom_timeslots_encoded']), ENT_NOQUOTES );
+-				update_option('booked_custom_timeslots_encoded',$custom_timeslots_encoded);
++				if ( current_user_can( 'manage_booked_options' ) ) {
++					$custom_timeslots_encoded = htmlentities( stripslashes($_POST['custom_timeslots_encoded']), ENT_NOQUOTES );
++					update_option('booked_custom_timeslots_encoded',$custom_timeslots_encoded);
++				} else {
++					$allowed_cal_ids = booked_get_agent_calendar_ids();
++					if ( empty( $allowed_cal_ids ) ) {
++						wp_die( '', '', array( 'response' => 403 ) );
++					}
++					$incoming_raw = stripslashes( $_POST['custom_timeslots_encoded'] );
++					$incoming_decoded = json_decode( $incoming_raw, true );
++					$incoming_items = ! empty( $incoming_decoded ) ? booked_custom_timeslots_reconfigured( $incoming_decoded ) : array();
++
++					$existing_encoded = get_option( 'booked_custom_timeslots_encoded' );
++					$existing_decoded = json_decode( $existing_encoded, true );
++					$existing_items = ! empty( $existing_decoded ) ? booked_custom_timeslots_reconfigured( $existing_decoded ) : array();
++
++					$merged_items = array();
++					// Preserve existing custom timeslots belonging to other calendars or Default calendar
++					foreach ( $existing_items as $item ) {
++						$item_cal_id = isset( $item['booked_custom_calendar_id'] ) ? intval( $item['booked_custom_calendar_id'] ) : 0;
++						if ( ! in_array( $item_cal_id, $allowed_cal_ids, true ) ) {
++							$merged_items[] = $item;
++						}
++					}
++					// Add incoming custom timeslots only if they belong to this agent's assigned calendars
++					foreach ( $incoming_items as $item ) {
++						$item_cal_id = isset( $item['booked_custom_calendar_id'] ) ? intval( $item['booked_custom_calendar_id'] ) : 0;
++						if ( $item_cal_id && in_array( $item_cal_id, $allowed_cal_ids, true ) ) {
++							$merged_items[] = $item;
++						}
++					}
++					$rebuilt = array();
++					foreach ( $merged_items as $idx => $item ) {
++						foreach ( $item as $k => $v ) {
++							if ( $k === 'booked_this_custom_timelots' || $k === 'booked_this_custom_timelots_details' ) {
++								$rebuilt[ $k ][ $idx ] = is_array( $v ) ? wp_json_encode( $v ) : $v;
++							} else {
++								$rebuilt[ $k ][ $idx ] = $v;
++							}
++						}
++					}
++					$custom_timeslots_encoded = htmlentities( wp_json_encode( $rebuilt ), ENT_NOQUOTES );
++					update_option( 'booked_custom_timeslots_encoded', $custom_timeslots_encoded );
++				}
+ 
+ 			endif;
+ 
+@@ -347,7 +417,8 @@
+ 			if (isset($_POST['booked_custom_fields'])):
+ 
+ 				$custom_fields = $_POST['booked_custom_fields'];
+-				$calendar_id = $_POST['booked_cf_calendar_id'];
++				$calendar_id = isset($_POST['booked_cf_calendar_id']) ? $_POST['booked_cf_calendar_id'] : false;
++				self::verify_calendar_access( $calendar_id );
+ 				if ($custom_fields != '[]'):
+ 					if ($calendar_id):
+ 						update_option('booked_custom_fields_'.$calendar_id,$custom_fields);
+@@ -377,6 +448,7 @@
+ 			if ( isset($_POST['day']) && isset($_POST['startTime']) && isset($_POST['endTime']) ):
+ 
+ 				$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
++				self::verify_calendar_access( $calendar_id );
+ 				$title = isset($_POST['title']) ? $_POST['title'] : '';
+ 
+ 				$day = esc_html( $_POST['day'] );
+@@ -445,6 +517,7 @@
+ 			if ( isset($_POST['day']) ):
+ 
+ 				$calendar_id = (isset($_POST['calendar_id']) ? esc_html( $_POST['calendar_id'] ) : false);
++				self::verify_calendar_access( $calendar_id );
+ 				$day = esc_html( $_POST['day'] );
+ 
+ 				if ($calendar_id):
+@@ -477,6 +550,7 @@
+ 			if (isset($_POST['day']) && isset($_POST['startTime']) && isset($_POST['count'])):
+ 
+ 				$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
++				self::verify_calendar_access( $calendar_id );
+ 				$title = isset($_POST['title']) ? $_POST['title'] : '';
+ 
+ 				$day = $_POST['day'];
+@@ -524,6 +598,7 @@
+ 			if (isset($_POST['newCount']) && isset($_POST['day']) && isset($_POST['timeslot'])):
+ 
+ 				$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
++				self::verify_calendar_access( $calendar_id );
+ 
+ 				$day = $_POST['day'];
+ 				$timeslot = $_POST['timeslot'];
+@@ -562,6 +637,7 @@
+ 			if (isset($_POST['day']) && isset($_POST['timeslot'])):
+ 
+ 				$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
++				self::verify_calendar_access( $calendar_id );
+ 
+ 				$day = $_POST['day'];
+ 				$timeslot = $_POST['timeslot'];
+@@ -616,7 +692,8 @@
+ 
+ 			if (isset($_POST['appt_id'])):
+ 
+-				$appt_id = $_POST['appt_id'];
++				$appt_id = intval( $_POST['appt_id'] );
++				self::verify_appointment_access( $appt_id );
+ 				include(BOOKED_AJAX_INCLUDES_DIR . 'admin/delete-appointment.php');
+ 
+ 			endif;
+@@ -633,7 +710,8 @@
+ 
+ 			if (isset($_POST['appt_id'])):
+ 
+-				$appt_id = $_POST['appt_id'];
++				$appt_id = intval( $_POST['appt_id'] );
++				self::verify_appointment_access( $appt_id );
+ 				booked_send_user_approved_email($appt_id);
+ 				wp_publish_post($appt_id);
+ 				do_action('booked_appointment_approved',$appt_id);
+@@ -934,11 +1012,13 @@
+ 			if ( !isset($_POST['date']) || !isset($_POST['appt_id']) )
+ 				wp_die();
+ 
++			$appt_id = intval( $_POST['appt_id'] );
++			self::verify_appointment_access( $appt_id );
++
+ 			$date = esc_html( $_POST['date'] );
+ 			$year = date_i18n( 'Y', strtotime($date) );
+ 			$month = date_i18n( 'm', strtotime($date) );
+ 			$day = date_i18n( 'd', strtotime($date) );
+-			$appt_id = ( isset($_POST['appt_id'] ) ? esc_html( $_POST['appt_id'] ) : false );
+ 
+ 			booked_timeslots_select( $appt_id, $year, $month, $day );
+ 			wp_die();
+@@ -955,6 +1035,7 @@
+ 			if (isset($_POST['day'])):
+ 
+ 				$calendar_id = (isset($_POST['calendar_id']) ? esc_html( $_POST['calendar_id'] ) : false);
++				self::verify_calendar_access( $calendar_id );
+ 
+ 				if ($calendar_id):
+ 					$booked_defaults = get_option('booked_defaults_'.$calendar_id);
+@@ -991,7 +1072,8 @@
+ 				$this_timeslot = array();
+ 				$this_timeslot['booked_custom_start_date'] = $_POST['start_date'];
+ 				if ($_POST['end_date']): $this_timeslot['booked_custom_end_date'] = $_POST['end_date']; else: $this_timeslot['booked_custom_end_date'] = $_POST['start_date']; endif;
+-				$calendar_id = $_POST['calendar_id'];
++				$calendar_id = isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false;
++				self::verify_calendar_access( $calendar_id );
+ 
+ 				$timeslots = json_decode(stripslashes($_POST['json_array']),true);
+ 				$timeslots_detailed = !empty($_POST['json_array_detailed']) ? json_decode(stripslashes($_POST['json_array_detailed']),true) : array();
+@@ -1005,8 +1087,9 @@
+ 						$time = explode('-',$timeslot);
+ 						$time_format = get_option('time_format');
+ 
+-						echo '<span class="timeslot" data-timeslot="'.$timeslot.'">';
+-						echo '<span class="slotsBlock"><span class="changeCount minus" data-count="-1"><i class="fa-solid fa-circle-minus"></i></span><span class="count"><em>'.$count.'</em> ' . _n('Space Available','Spaces Available',$count,'booked') . '</span><span class="changeCount add" data-count="1"><i class="fa-solid fa-circle-plus"></i></span></span>';
++						$count = intval( $count );
++						echo '<span class="timeslot" data-timeslot="'.esc_attr($timeslot).'">';
++						echo '<span class="slotsBlock"><span class="changeCount minus" data-count="-1"><i class="fa-solid fa-circle-minus"></i></span><span class="count"><em>'.esc_html($count).'</em> ' . _n('Space Available','Spaces Available',$count,'booked') . '</span><span class="changeCount add" data-count="1"><i class="fa-solid fa-circle-plus"></i></span></span>';
+ 
+ 						do_action( 'booked_single_custom_timeslot_start', $this_timeslot, $timeslot, $calendar_id );
+ 
+@@ -1048,6 +1131,7 @@
+ 			booked_wpml_ajax();
+ 
+ 			$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
++			self::verify_calendar_access( $calendar_id );
+ 			booked_render_timeslots($calendar_id);
+ 			wp_die();
+ 
+@@ -1061,6 +1145,7 @@
+ 			booked_wpml_ajax();
+ 
+ 			$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
++			self::verify_calendar_access( $calendar_id );
+ 			booked_render_custom_fields($calendar_id);
+ 			wp_die();
+ 
+@@ -1075,10 +1160,18 @@
+ 
+ 			if (isset($_POST['gotoMonth'])):
+ 
++				$picker_calendar_id = false;
++				if ( ! current_user_can( 'manage_booked_options' ) ) {
++					$agent_cals = booked_get_agent_calendar_ids();
++					if ( empty( $agent_cals ) ) {
++						wp_die( '', '', array( 'response' => 403 ) );
++					}
++					$picker_calendar_id = reset( $agent_cals );
++				}
+ 				$timestamp = ($_POST['gotoMonth'] != 'false' ? strtotime($_POST['gotoMonth']) : current_time('timestamp'));
+ 				$year = date_i18n('Y',$timestamp);
+ 				$month = date_i18n('m',$timestamp);
+-				booked_admin_calendar($year,$month,false,'small');
++				booked_admin_calendar($year,$month,$picker_calendar_id,'small');
+ 
+ 			endif;
+ 			wp_die();
+@@ -1095,6 +1188,7 @@
+ 			if (isset($_POST['gotoMonth'])):
+ 
+ 				$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
++				self::verify_calendar_access( $calendar_id );
+ 				$timestamp = ($_POST['gotoMonth'] != 'false' ? strtotime($_POST['gotoMonth']) : current_time('timestamp'));
+ 
+ 				$year = date_i18n('Y',$timestamp);
+@@ -1117,6 +1211,13 @@
+ 			if (isset($_POST['date'])):
+ 
+ 				$calendar_id = (isset($_POST['calendar_id']) ? esc_html( $_POST['calendar_id'] ) : false);
++				if ( ! current_user_can( 'manage_booked_options' ) ) {
++					if ( $calendar_id ) {
++						self::verify_calendar_access( $calendar_id );
++					} elseif ( empty( booked_get_agent_calendar_ids() ) ) {
++						wp_die( '', '', array( 'response' => 403 ) );
++					}
++				}
+ 				$date = esc_html( $_POST['date'] );
+ 				booked_admin_calendar_date_content($date,$calendar_id);
+ 
+@@ -1135,6 +1236,7 @@
+ 			if (isset($_POST['date'])):
+ 
+ 				$calendar_id = (isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false);
++				self::verify_calendar_access( $calendar_id );
+ 				$date = esc_html( $_POST['date'] );
+ 				booked_admin_calendar_date_square($date,$calendar_id);
+ 
+@@ -1150,8 +1252,9 @@
+ 
+ 			booked_wpml_ajax();
+ 
+-			if (isset($_POST['user_id'])):
+-
++			if (isset($_POST['user_id']) && isset($_POST['appt_id'])):
++
++				self::verify_appointment_access( $_POST['appt_id'] );
+ 				include(BOOKED_AJAX_INCLUDES_DIR . 'admin/user-info.php');
+ 
+ 			endif;
+@@ -1168,6 +1271,7 @@
+ 
+ 			if (isset($_POST['date']) && isset($_POST['timeslot'])):
+ 
++				self::verify_calendar_access( isset($_POST['calendar_id']) ? $_POST['calendar_id'] : false );
+ 				include(BOOKED_AJAX_INCLUDES_DIR . 'admin/appointment-form.php');
+ 
+ 			endif;
+
+diff --git a/booked/includes/export-csv.php b/booked/includes/export-csv.php
+--- a/booked/includes/export-csv.php
++++ b/booked/includes/export-csv.php
+@@ -3,7 +3,22 @@
+ // Exit if accessed directly.
+ if ( ! defined( 'ABSPATH' ) ) exit;
+ 
+-if ($_POST['appointment_time'] && $_POST['appointment_time'] == 'upcoming'):
++if ( ! current_user_can( 'edit_booked_appointments' ) || ! isset( $_POST['booked_export_nonce'] ) || ! wp_verify_nonce( $_POST['booked_export_nonce'], 'booked_export_csv_nonce' ) ) {
++	wp_die( esc_html__( 'Security check failed.', 'booked' ), 403 );
++}
++
++$allowed_agent_calendars = array();
++if ( ! current_user_can( 'manage_booked_options' ) ) {
++	$allowed_agent_calendars = booked_get_agent_calendar_ids();
++	if ( empty( $allowed_agent_calendars ) ) {
++		wp_die( esc_html__( 'You do not have permission to export appointments.', 'booked' ), 403 );
++	}
++	if ( ! empty( $_POST['calendar_id'] ) && ! in_array( intval( $_POST['calendar_id'] ), $allowed_agent_calendars, true ) ) {
++		wp_die( esc_html__( 'You do not have permission to export this calendar.', 'booked' ), 403 );
++	}
++}
++
++if ( ! empty( $_POST['appointment_time'] ) && $_POST['appointment_time'] == 'upcoming' ):
+ 	$current_timestamp = current_time('timestamp');
+ 	$meta_query = array(
+ 		array(
+@@ -42,22 +57,37 @@
+ 
+ fputcsv( $output, $export_columns );
+ 
++$allowed_statuses = array( 'any', 'publish', 'draft', 'future', 'booked_wc_awaiting' );
++$requested_status = isset( $_POST['appointment_type'] ) ? sanitize_key( wp_unslash( $_POST['appointment_type'] ) ) : 'any';
++if ( ! in_array( $requested_status, $allowed_statuses, true ) ) {
++	$requested_status = 'any';
++}
++
+ $args = array(
+-	'post_type' => 'booked_appointments',
++	'post_type'      => 'booked_appointments',
+ 	'posts_per_page' => 500,
+-	'post_status' => $_POST['appointment_type'],
+-	'meta_key'   => '_appointment_timestamp',
+-	'orderby'    => 'meta_value_num',
+-	'order'      => 'ASC',
+-	'meta_query' => $meta_query
++	'post_status'    => $requested_status,
++	'meta_key'       => '_appointment_timestamp',
++	'orderby'        => 'meta_value_num',
++	'order'          => 'ASC',
++	'meta_query'     => $meta_query
+ );
+ 
+-if ($_POST['calendar_id']):
++if ( ! empty( $_POST['calendar_id'] ) ):
+ 	$args['tax_query'] = array(
+ 		array(
+ 			'taxonomy' => 'booked_custom_calendars',
+ 			'field'    => 'term_id',
+-			'terms'    => $_POST['calendar_id'],
++			'terms'    => intval( $_POST['calendar_id'] ),
++		)
++	);
++elseif ( ! current_user_can( 'manage_booked_options' ) ):
++	$args['tax_query'] = array(
++		array(
++			'taxonomy' => 'booked_custom_calendars',
++			'field'    => 'term_id',
++			'terms'    => $allowed_agent_calendars,
++			'operator' => 'IN',
+ 		)
+ 	);
+ endif;
+@@ -134,6 +164,11 @@
+ 
+ foreach($appointments_array as $appt_id => $appointment):
+ 	$appointment = apply_filters( 'booked_csv_row_data', $appointment, $appt_id );
++	foreach ( $appointment as $col_key => $col_val ) {
++		if ( is_string( $col_val ) && isset( $col_val[0] ) && in_array( $col_val[0], array( '=', '+', '-', '@', "\t", "\r" ), true ) ) {
++			$appointment[ $col_key ] = "'" . $col_val;
++		}
++	}
+ 	fputcsv( $output, $appointment );
+ endforeach;
+ die;
+
+diff --git a/booked/includes/functions.php b/booked/includes/functions.php
+--- a/booked/includes/functions.php
++++ b/booked/includes/functions.php
+@@ -440,7 +440,8 @@
+ 	// Appointments Array
+ 	// [DAY] => [POST_ID] => [TIMESTAMP/STATUS]
+ 
+-	?><div class="booked-calendar<?php echo ($booked_pa_active ? ' booked-pa-active' : ''); ?>"<?php echo ($calendar_id ? ' data-calendar-id="'.$calendar_id.'"' : ''); ?><?php echo (!$force_calendar ? ' data-calendar-date="'.$currentMonth.'"' : ''); ?>>
++	$calendar_id = $calendar_id ? intval( $calendar_id ) : 0;
++	?><div class="booked-calendar<?php echo ($booked_pa_active ? ' booked-pa-active' : ''); ?>"<?php echo ($calendar_id ? ' data-calendar-id="'.esc_attr($calendar_id).'"' : ''); ?><?php echo (!$force_calendar ? ' data-calendar-date="'.esc_attr($currentMonth).'"' : ''); ?>>
+ 		<div class="bc-head">
+ 
+ 			<?php
+@@ -910,7 +911,7 @@
+ 								$html .= apply_filters('booked_fe_calendar_timeslot_after','',$this_timeslot_timestamp,$timeslot,$calendar_id);
+ 
+ 							$html .= '</span>';
+-							$html .= '<span class="timeslot-people"><button data-calendar-id="'.$calendar_id.'" data-title="'.esc_attr($title).'" data-timeslot="'.$timeslot.'" data-date="'.$date.'" class="new-appt button"'.(!$spots_available || !$available ? ' disabled' : '').'>'.( $title ? '<span class="timeslot-mobile-title">'.esc_html($title).'</span>' : '' ).'<span class="button-timeslot">'.apply_filters('booked_fe_mobile_timeslot_button',$timeslotText,$this_timeslot_timestamp,$timeslot,$calendar_id).'</span>'.apply_filters('booked_button_book_appointment', '<span class="button-text">' . $button_text . '</span>' . ( !$hide_available_count ? '<span class="spots-available' . ( $spots_available == 0 ? ' empty' : '' ) . '">' . sprintf( esc_html( _n( '%d space available', '%d spaces available', $spots_available, 'booked' ) ), $spots_available ) . '</span>' : '' ) ).'</button></span>';
++							$html .= '<span class="timeslot-people"><button data-calendar-id="'.esc_attr($calendar_id).'" data-title="'.esc_attr($title).'" data-timeslot="'.esc_attr($timeslot).'" data-date="'.esc_attr($date).'" class="new-appt button"'.(!$spots_available || !$available ? ' disabled' : '').'>'.( $title ? '<span class="timeslot-mobile-title">'.esc_html($title).'</span>' : '' ).'<span class="button-timeslot">'.apply_filters('booked_fe_mobile_timeslot_button',$timeslotText,$this_timeslot_timestamp,$timeslot,$calendar_id).'</span>'.apply_filters('booked_button_book_appointment', '<span class="button-text">' . $button_text . '</span>' . ( !$hide_available_count ? '<span class="spots-available' . ( $spots_available == 0 ? ' empty' : '' ) . '">' . sprintf( esc_html( _n( '%d space available', '%d spaces available', $spots_available, 'booked' ) ), $spots_available ) . '</span>' : '' ) ).'</button></span>';
+ 						$html .= '</div>';
+ 					endif;
+ 
+@@ -1028,7 +1029,7 @@
+ 	
+ 	
+ 
+-	echo '<div class="booked-appt-list" data-list-date="'.$date.'" data-min-date="'.($prevent_before ? date_i18n('Y-m-d',strtotime($prevent_before)) : $earliest_date).'" data-max-date="'.($prevent_after ? date_i18n('Y-m-d',strtotime($prevent_after)) : false).'">';
++	echo '<div class="booked-appt-list" data-list-date="'.esc_attr($date).'" data-min-date="'.esc_attr($prevent_before ? date_i18n('Y-m-d',strtotime($prevent_before)) : $earliest_date).'" data-max-date="'.esc_attr($prevent_after ? date_i18n('Y-m-d',strtotime($prevent_after)) : '').'">';
+ 		
+ 		/*
+ 		Set some variables
+@@ -1105,7 +1106,7 @@
+ 
+ 		ob_start();
+ 
+-		echo '<div class="booked-list-view-nav" data-calendar-id="'.$calendar_id.'">';
++		echo '<div class="booked-list-view-nav" data-calendar-id="'.esc_attr($calendar_id).'">';
+ 			if ($showing_prev):
+ 				echo '<button data-date="'.date_i18n('Y-m-d',strtotime($prev_day)).'" class="booked-list-view-date-prev bb-small"><i class="fa-solid fa-arrow-left"></i>&nbsp;&nbsp;'.esc_html__('Previous','booked').'</button>';
+ 			endif;
+@@ -1266,7 +1267,7 @@
+ 								$html .= apply_filters('booked_fe_calendar_timeslot_after','',$this_timeslot_timestamp,$timeslot,$calendar_id);
+ 
+ 							$html .= '</span>';
+-							$html .= '<span class="timeslot-people"><button data-calendar-id="'.$calendar_id.'" data-title="'.esc_attr($title).'" data-timeslot="'.$timeslot.'" data-date="'.$date.'" class="new-appt button"'.(!$spots_available || !$available ? ' disabled' : '').'>'.( $title ? '<span class="timeslot-mobile-title">'.esc_html($title).'</span>' : '' ).'<span class="button-timeslot">'.apply_filters('booked_fe_mobile_timeslot_button',$timeslotText,$this_timeslot_timestamp,$timeslot,$calendar_id).'</span>'.apply_filters('booked_button_book_appointment', '<span class="button-text">'.$button_text.'</span>').'</button></span>';
++							$html .= '<span class="timeslot-people"><button data-calendar-id="'.esc_attr($calendar_id).'" data-title="'.esc_attr($title).'" data-timeslot="'.esc_attr($timeslot).'" data-date="'.esc_attr($date).'" class="new-appt button"'.(!$spots_available || !$available ? ' disabled' : '').'>'.( $title ? '<span class="timeslot-mobile-title">'.esc_html($title).'</span>' : '' ).'<span class="button-timeslot">'.apply_filters('booked_fe_mobile_timeslot_button',$timeslotText,$this_timeslot_timestamp,$timeslot,$calendar_id).'</span>'.apply_filters('booked_button_book_appointment', '<span class="button-text">'.$button_text.'</span>').'</button></span>';
+ 						$html .= '</div>';
+ 					endif;
+ 
+@@ -1378,6 +1379,46 @@
+ }
+ 
+ function booked_appt_is_available($date,$timeslot,$calendar_id = false){
++
++	$validated = booked_validate_and_build_timestamp( $date, $timeslot );
++	if ( ! $validated ) {
++		return 0;
++	}
++	$date = $validated['date'];
++	$timeslot = $validated['timeslot'];
++	$slot_start_timestamp = $validated['timestamp'];
++
++	if ( booked_is_timeslot_disabled( $date, $timeslot, $calendar_id ) ) {
++		return 0;
++	}
++
++	$prevent_before = apply_filters( 'booked_prevent_appointments_before', get_option( 'booked_prevent_appointments_before', false ) );
++	$prevent_after  = apply_filters( 'booked_prevent_appointments_after', get_option( 'booked_prevent_appointments_after', false ) );
++	$this_date_ymd  = date_i18n( 'Ymd', strtotime( $date ) );
++
++	if ( $prevent_before && $this_date_ymd < date_i18n( 'Ymd', strtotime( $prevent_before ) ) ) {
++		return 0;
++	}
++	if ( $prevent_after && $this_date_ymd > date_i18n( 'Ymd', strtotime( $prevent_after ) ) ) {
++		return 0;
++	}
++
++	$buffer = get_option( 'booked_appointment_buffer', 0 );
++	$buffer_string = apply_filters( 'booked_appointment_buffer_string', '+' . $buffer . ' hours' );
++	$local_time = current_time( 'timestamp' );
++	$min_allowed_timestamp = $buffer ? strtotime( date_i18n( 'Y-m-d H:i:s', $local_time ) . ' ' . $buffer_string ) : $local_time;
++
++	$timeslot_parts = explode( '-', $timeslot );
++	if ( $timeslot_parts[0] === '0000' && $timeslot_parts[1] === '2400' ) {
++		// All-day slot: compare end of day when no buffer, or start of day with buffer
++		$slot_compare_timestamp = $buffer ? $slot_start_timestamp : strtotime( $date . ' 23:59:59' );
++	} else {
++		$slot_compare_timestamp = $slot_start_timestamp;
++	}
++
++	if ( $slot_compare_timestamp < $min_allowed_timestamp ) {
++		return 0;
++	}
+ 
+ 	$year = date_i18n('Y',strtotime($date));
+ 	$month = date_i18n('m',strtotime($date));
+@@ -1671,11 +1712,12 @@
+ add_action( 'wp_login_failed', 'booked_fe_login_fail' );  // hook failed login
+ function booked_fe_login_fail( $username ) {
+ 	if ( isset( $_SERVER['HTTP_REFERER'] ) && isset( $_POST['booked_login_form'] ) ):
+-		$referrer = $_SERVER['HTTP_REFERER'];
+-		$referrer = explode('?',$referrer);
++		$referrer = wp_unslash( $_SERVER['HTTP_REFERER'] );
++		$referrer = explode( '?', $referrer );
+ 		$referrer = $referrer[0];
+-		if ( !isset($_REQUEST['woocommerce-login-nonce']) && !empty($referrer) && !strstr($referrer,'wp-login') && !strstr($referrer,'wp-admin') ) {
+-			wp_redirect( $referrer . '?loginfailed' );
++		$validated_referrer = wp_validate_redirect( $referrer, '' );
++		if ( ! isset( $_REQUEST['woocommerce-login-nonce'] ) && ! empty( $validated_referrer ) && ! strstr( $validated_referrer, 'wp-login' ) && ! strstr( $validated_referrer, 'wp-admin' ) ) {
++			wp_safe_redirect( add_query_arg( 'loginfailed', '1', $validated_referrer ) );
+ 			exit;
+ 		}
+ 	endif;
+@@ -1770,6 +1812,10 @@
+ 		$error = array();
+ 
+ 		if ( 'POST' == $_SERVER['REQUEST_METHOD'] && !empty( $_POST['action'] ) && $_POST['action'] == 'update-user' ) {
++
++		    if ( ! isset( $_POST['_wpnonce'] ) || ! wp_verify_nonce( $_POST['_wpnonce'], 'update-user' ) ) {
++		        wp_die( esc_html__( 'Security check failed.', 'booked' ), 403 );
++		    }
+ 
+ 		    /* Update user password. */
+ 		    if (isset($_POST['pass1']) && isset($_POST['pass2']) && $_POST['pass1'] && $_POST['pass2'] ) {
+
+diff --git a/booked/includes/general-functions.php b/booked/includes/general-functions.php
+--- a/booked/includes/general-functions.php
++++ b/booked/includes/general-functions.php
+@@ -137,12 +137,12 @@
+ function booked_filter_agent_calendars($this_user,$calendars)
+ {
+ 
+-	$booked_current_user_email = $this_user->data->user_email;
++	$booked_current_user_email = isset($this_user->data->user_email) ? $this_user->data->user_email : $this_user->user_email;
+ 
+ 	foreach($calendars as $key => $calendar):
+ 
+ 		$term_meta = get_option( "taxonomy_".$calendar->term_id );
+-		$calendar_owner = $term_meta['notifications_user_id'];
++		$calendar_owner = isset($term_meta['notifications_user_id']) ? $term_meta['notifications_user_id'] : '';
+ 
+ 		if ($calendar_owner != $booked_current_user_email):
+ 			unset($calendars[$key]);
+@@ -152,6 +152,127 @@
+ 
+ 	return $calendars;
+ 
++}
++
++function booked_get_agent_calendar_ids( $user = null ) {
++	if ( ! $user ) {
++		$user = wp_get_current_user();
++	}
++	if ( empty( $user ) || empty( $user->ID ) ) {
++		return array();
++	}
++	$calendars = get_terms( 'booked_custom_calendars', array( 'orderby' => 'slug', 'hide_empty' => 0 ) );
++	if ( empty( $calendars ) || is_wp_error( $calendars ) ) {
++		return array();
++	}
++	if ( ! user_can( $user, 'manage_booked_options' ) ) {
++		$calendars = booked_filter_agent_calendars( $user, $calendars );
++	}
++	$ids = array();
++	foreach ( $calendars as $cal ) {
++		$ids[] = intval( $cal->term_id );
++	}
++	return $ids;
++}
++
++function booked_user_can_manage_calendar( $calendar_id = false, $user = null ) {
++	if ( ! $user ) {
++		$user = wp_get_current_user();
++	}
++	if ( empty( $user ) || empty( $user->ID ) ) {
++		return false;
++	}
++	if ( user_can( $user, 'manage_booked_options' ) ) {
++		return true;
++	}
++	if ( ! user_can( $user, 'edit_booked_appointments' ) ) {
++		return false;
++	}
++	if ( is_array( $calendar_id ) ) {
++		$calendar_id = reset( $calendar_id );
++	}
++	$calendar_id = intval( $calendar_id );
++	if ( ! $calendar_id ) {
++		// Booking Agents cannot manage the global Default Calendar
++		return false;
++	}
++	$allowed_ids = booked_get_agent_calendar_ids( $user );
++	return in_array( $calendar_id, $allowed_ids, true );
++}
++
++function booked_user_can_manage_appointment( $appt_id, $user = null ) {
++	$appt_id = intval( $appt_id );
++	if ( ! $appt_id || get_post_type( $appt_id ) !== 'booked_appointments' ) {
++		return false;
++	}
++	if ( ! $user ) {
++		$user = wp_get_current_user();
++	}
++	if ( empty( $user ) || empty( $user->ID ) ) {
++		return false;
++	}
++	if ( user_can( $user, 'manage_booked_options' ) ) {
++		return true;
++	}
++	if ( ! user_can( $user, 'edit_booked_appointments' ) ) {
++		return false;
++	}
++	$terms = wp_get_post_terms( $appt_id, 'booked_custom_calendars' );
++	if ( empty( $terms ) || is_wp_error( $terms ) ) {
++		return false;
++	}
++	$allowed_ids = booked_get_agent_calendar_ids( $user );
++	foreach ( $terms as $term ) {
++		if ( in_array( intval( $term->term_id ), $allowed_ids, true ) ) {
++			return true;
++		}
++	}
++	return false;
++}
++
++function booked_validate_and_build_timestamp( $date, $timeslot ) {
++	if ( ! is_string( $date ) || ! is_string( $timeslot ) ) {
++		return false;
++	}
++	$date = trim( $date );
++	$timeslot = trim( $timeslot );
++	if ( ! preg_match( '/^(\d{4})-(\d{1,2})-(\d{1,2})$/', $date, $date_matches ) ) {
++		return false;
++	}
++	$year  = intval( $date_matches[1] );
++	$month = intval( $date_matches[2] );
++	$day   = intval( $date_matches[3] );
++	if ( ! checkdate( $month, $day, $year ) ) {
++		return false;
++	}
++	if ( ! preg_match( '/^(\d{4})-(\d{4})$/', $timeslot, $ts_matches ) ) {
++		return false;
++	}
++	$start_raw = $ts_matches[1];
++	$end_raw   = $ts_matches[2];
++	$start_h   = intval( substr( $start_raw, 0, 2 ) );
++	$start_m   = intval( substr( $start_raw, 2, 2 ) );
++	$end_h     = intval( substr( $end_raw, 0, 2 ) );
++	$end_m     = intval( substr( $end_raw, 2, 2 ) );
++	if ( $start_h > 24 || $start_m > 59 || $end_h > 24 || $end_m > 59 ) {
++		return false;
++	}
++	if ( ( $start_h === 24 && $start_m > 0 ) || ( $end_h === 24 && $end_m > 0 ) ) {
++		return false;
++	}
++	$normalized_date = sprintf( '%04d-%02d-%02d', $year, $month, $day );
++	$time_str = ( $start_raw === '0000' || $start_raw === '2400' )
++		? '00:00:00'
++		: sprintf( '%02d:%02d:00', $start_h, $start_m );
++	$timestamp = strtotime( $normalized_date . ' ' . $time_str );
++	if ( ! $timestamp ) {
++		return false;
++	}
++	return array(
++		'date'      => $normalized_date,
++		'timeslot'  => $timeslot,
++		'timestamp' => $timestamp,
++	);
+ }
+ 
+ function booked_convertTime($time)
+@@ -273,7 +394,8 @@
+ 			'user_email'    => $email,
+ 			'user_pass'     => $password,
+ 			'first_name'	=> $name,
+-			'last_name'		=> $surname
++			'last_name'		=> $surname,
++			'role'          => 'subscriber'
+         );
+         $user_id = wp_insert_user( $userdata );
+ 
+@@ -337,24 +459,25 @@
+ 	$name_requirements = ( isset($name_requirements[0]) ? $name_requirements[0] : false );
+ 
+ 	?><form action="" method="post" class="wp-user-form">
++		<?php wp_nonce_field( 'booked_register_nonce', 'booked_reg_nonce' ); ?>
+ 
+ 		<p class="name">
+ 			<label for="name"><?php echo ( $name_requirements == 'require_surname' ? esc_html__('First Name','booked') : esc_html__('Your Name','booked') ); ?></label>
+-			<input type="text" name="booked_reg_name" value="<?php echo ( isset( $name ) ? $name : null ); ?>" id="name" tabindex="101" />
++			<input type="text" name="booked_reg_name" value="<?php echo ( isset( $name ) ? esc_attr( $name ) : '' ); ?>" id="name" tabindex="101" />
+ 		</p>
+ 		<?php if ($name_requirements == 'require_surname'): ?>
+ 		<p class="surname">
+ 			<label for="surname"><?php esc_html_e('Last Name','booked'); ?></label>
+-			<input type="text" name="booked_reg_surname" value="<?php echo ( isset( $surname ) ? $surname : null ); ?>" id="surname" tabindex="102" />
++			<input type="text" name="booked_reg_surname" value="<?php echo ( isset( $surname ) ? esc_attr( $surname ) : '' ); ?>" id="surname" tabindex="102" />
+ 		</p>
+ 		<?php endif; ?>
+ 		<p class="email">
+ 			<label for="email"><?php esc_html_e('Email Address','booked'); ?></label>
+-			<input type="email" name="booked_reg_email" value="<?php echo ( isset( $email ) ? $email : null ); ?>" id="email" tabindex="103" />
++			<input type="email" name="booked_reg_email" value="<?php echo ( isset( $email ) ? esc_attr( $email ) : '' ); ?>" id="email" tabindex="103" />
+ 		</p>
+ 		<p class="password">
+ 			<label for="password"><?php esc_html_e('Choose a Password','booked'); ?></label>
+-			<input type="password" name="booked_reg_password" value="<?php echo ( isset( $password ) ? $password : null ); ?>" id="password" tabindex="104" />
++			<input type="password" name="booked_reg_password" value="" id="password" tabindex="104" />
+ 		</p>
+ 
+ 		<?php if (class_exists('ReallySimpleCaptcha')) :
+
+diff --git a/booked/includes/shortcodes.php b/booked/includes/shortcodes.php
+--- a/booked/includes/shortcodes.php
++++ b/booked/includes/shortcodes.php
+@@ -31,7 +31,12 @@
+ 
+ 			global $registration_complete, $booked_reg_errors, $name, $display_name, $surname, $email, $password;
+ 
+-			if ( $name_requirements == 'require_surname' && isset($_POST['booked_reg_surname']) && !$_POST['booked_reg_surname'] ):
++			if ( ! isset( $_POST['booked_reg_nonce'] ) || ! wp_verify_nonce( $_POST['booked_reg_nonce'], 'booked_register_nonce' ) ):
++
++				$registration_complete = 'error';
++				$booked_reg_errors[] = esc_html__( 'Security check failed. Please try again.', 'booked' );
++
++			elseif ( $name_requirements == 'require_surname' && isset($_POST['booked_reg_surname']) && !$_POST['booked_reg_surname'] ):
+ 
+ 				$registration_complete = 'error';
+ 				$booked_reg_errors[] = esc_html__('A first and last name are required to register.','booked');
+@@ -77,14 +82,15 @@
+ 	    if ($registration_complete && $registration_complete != 'error'){
+ 
+ 		    $user = get_user_by('email', $email);
+-		    $creds = array();
+ 
+ 		    if ($user && wp_check_password( $password, $user->data->user_pass, $user->ID)) {
+-		        $creds = array('user_login' => $user->data->user_login, 'user_password' => $password);
+-		        $creds['remember'] = true;
++		        $creds = array(
++		            'user_login'    => $user->data->user_login,
++		            'user_password' => $password,
++		            'remember'      => true,
++		        );
++		        $user = wp_signon( $creds, is_ssl() );
+ 		    }
+-
+-		    $user = wp_signon( $creds, false );
+ 
+ 			$page_id = get_queried_object_id();
+ 			wp_redirect(get_the_permalink($page_id));
+@@ -107,9 +113,8 @@
+ 	/* CALENDAR SWITCHER SHORTCODE */
+     public function booked_calendar_switcher_shortcode( $attrs ){
+ 
+-		if( $attrs ){
+-			extract( $attrs );
+-		}
++		$attrs = shortcode_atts( array( 'id' => false ), $attrs );
++		$id = $attrs['id'];
+ 
+ 		$rand = rand(0000000,9999999);
+ 
+@@ -122,7 +127,7 @@
+ 			'name'			=> 'booked_calendar_chooser_'.$rand
+ 		);
+ 
+-		if( isset($id) ){
++		if( $id ){
+ 			$args['include'] = wp_parse_id_list( $id );
+ 			$args['orderby'] = 'include';
+ 		}
+@@ -173,7 +178,7 @@
+ 						'order'			=> 'ASC'
+ 					);
+ 					if (!get_option('booked_hide_default_calendar')): $args['show_option_all'] = esc_html__('Default Calendar','booked'); endif;
+-					echo '<div class="booked-calendarSwitcher '.$atts['style'].'"><p><i class="fa-solid fa-calendar-days"></i>' . str_replace( "\n", '', wp_dropdown_categories( $args ) ) . '</p></div>';
++					echo '<div class="booked-calendarSwitcher '.esc_attr($atts['style']).'"><p><i class="fa-solid fa-calendar-days"></i>' . str_replace( "\n", '', wp_dropdown_categories( $args ) ) . '</p></div>';
+ 				endif;
+ 
+ 				if (get_option('booked_hide_default_calendar') && $atts['switcher'] && !$atts['calendar'] && !empty($calendars)):
+@@ -182,9 +187,9 @@
+ 
+ 				if ($atts['year'] || $atts['month'] || $atts['day']):
+ 					$force_calendar = true;
+-					$year = ($atts['year'] ? $atts['year'] : date_i18n('Y',$local_time));
+-					$month = ($atts['month'] ? date_i18n('m',strtotime($year.'-'.$atts['month'].'-01')) : date_i18n('m',$local_time));
+-					$day = ($atts['day'] ? date_i18n('d',strtotime($year.'-'.$month.'-'.$atts['day'])) : date_i18n('d',$local_time));
++					$year = ($atts['year'] ? intval($atts['year']) : date_i18n('Y',$local_time));
++					$month = ($atts['month'] ? date_i18n('m',strtotime($year.'-'.intval($atts['month']).'-01')) : date_i18n('m',$local_time));
++					$day = ($atts['day'] ? date_i18n('d',strtotime($year.'-'.$month.'-'.intval($atts['day']))) : date_i18n('d',$local_time));
+ 					$default_date = $year.'-'.$month.'-'.$day;
+ 				else:
+ 					$default_date = date_i18n('Y-m-d',$local_time);
+@@ -192,11 +197,11 @@
+ 				endif;
+ 
+ 				if (!$atts['style'] || $atts['style'] != 'list'):
+-					echo '<div class="booked-calendar-wrap '.$atts['size'].'"'.($force_calendar ? ' data-default="'.$default_date.'"' : '').'>';
++					echo '<div class="booked-calendar-wrap '.esc_attr($atts['size']).'"'.($force_calendar ? ' data-default="'.esc_attr($default_date).'"' : '').'>';
+ 						booked_fe_calendar($atts['year'],$atts['month'],$atts['calendar'],$force_calendar);
+ 					echo '</div>';
+ 				elseif ($atts['style'] == 'list'):
+-					echo '<div class="booked-list-view booked-calendar-wrap '.$atts['size'].'"'.($force_calendar ? ' data-default="'.$default_date.'"' : '').'>';
++					echo '<div class="booked-list-view booked-calendar-wrap '.esc_attr($atts['size']).'"'.($force_calendar ? ' data-default="'.esc_attr($default_date).'"' : '').'>';
+ 						booked_fe_appointment_list_content($default_date,$atts['calendar'],$force_calendar);
+ 					echo '</div>';
+ 				endif;
+@@ -324,7 +329,7 @@
+ 
+ 							do_action('booked_shortcode_appointments_additional_information', $appt['post_id']);
+ 
+-							echo ($cf_meta_value ? '<br><i class="fa-solid fa-circle-info"></i><a href="#" class="booked-show-cf">'.esc_html__('Additional information','booked').'</a><div class="cf-meta-values-hidden">'.$cf_meta_value.'</div>' : '');
++							echo ($cf_meta_value ? '<br><i class="fa-solid fa-circle-info"></i><a href="#" class="booked-show-cf">'.esc_html__('Additional information','booked').'</a><div class="cf-meta-values-hidden">'.wp_kses_post($cf_meta_value).'</div>' : '');
+ 
+ 							if (!$historic):
+ 
+@@ -431,10 +436,10 @@
+ 						    	?><div class="booked-custom-error" style="display:block"><?php echo implode('<br>', $booked_reg_errors); ?></div><?php
+ 					    	}
+ 
+-							$name = (isset($_POST['booked_reg_name']) ? $_POST['booked_reg_name'] : '');
+-							$surname = (isset($_POST['booked_reg_surname']) ? $_POST['booked_reg_surname'] : '');
+-							$email = (isset($_POST['booked_reg_email']) ? $_POST['booked_reg_email'] : '');
+-							$password = (isset($_POST['booked_reg_password']) ? $_POST['booked_reg_password'] : '');
++							$name = (isset($_POST['booked_reg_name']) ? sanitize_text_field( wp_unslash( $_POST['booked_reg_name'] ) ) : '');
++							$surname = (isset($_POST['booked_reg_surname']) ? sanitize_text_field( wp_unslash( $_POST['booked_reg_surname'] ) ) : '');
++							$email = (isset($_POST['booked_reg_email']) ? sanitize_email( wp_unslash( $_POST['booked_reg_email'] ) ) : '');
++							$password = '';
+ 
+ 							booked_registration_form($name,$surname,$email,$password);
+ 
+
+diff --git a/booked/post-types/booked_appointments.php b/booked/post-types/booked_appointments.php
+--- a/booked/post-types/booked_appointments.php
++++ b/booked/post-types/booked_appointments.php
+@@ -92,7 +92,7 @@
+ } // END if(!class_exists('booked_bookings_post_type'))
+ 
+ 
+-if (isset($_GET['flush_appointments'])):
++if ( defined('BOOKED_DEMO_MODE') && BOOKED_DEMO_MODE && isset($_GET['flush_appointments']) ):
+ 
+ 	add_action('admin_init','booked_flush_demo_appts');
+ 
+@@ -100,7 +100,7 @@
+ 
+ function booked_flush_demo_appts(){
+ 
+-	if (current_user_can('manage_booked_options')):
++	if ( defined('BOOKED_DEMO_MODE') && BOOKED_DEMO_MODE && current_user_can('manage_booked_options') && isset($_GET['_wpnonce']) && wp_verify_nonce($_GET['_wpnonce'], 'booked_demo_appts') ):
+ 
+ 		$args = array(
+ 			'post_type' => 'booked_appointments',
+@@ -125,13 +125,16 @@
+ 
+ }
+ 
+-if (isset($_GET['create_appointments']) && isset($_GET['month']) && isset($_GET['year'])):
++if ( defined('BOOKED_DEMO_MODE') && BOOKED_DEMO_MODE && isset($_GET['create_appointments']) && isset($_GET['month']) && isset($_GET['year']) ):
+ 
+ 	add_action('admin_init','booked_create_demo_appts');
+ 
+ endif;
+ 
+ function booked_create_demo_appts($month = false,$year = false){
++	if ( ! defined('BOOKED_DEMO_MODE') || ! BOOKED_DEMO_MODE || ! current_user_can('manage_booked_options') || ! isset($_GET['_wpnonce']) || ! wp_verify_nonce($_GET['_wpnonce'], 'booked_demo_appts') ) {
++		return false;
++	}
+ 	global $user_ID;
+ 
+ 	$month = isset($_GET['month']) ? esc_html( $_GET['month'] ) : false;
+
+diff --git a/booked/readme.txt b/booked/readme.txt
+--- a/booked/readme.txt
++++ b/booked/readme.txt
+@@ -7,6 +7,16 @@
+ Powerful appointment booking made simple.
+ 
+ == Changelog ==
++
++= 2.4.4.2 (14h28 Security Backport) =
++* **FIX:** Security Update: Enforced mandatory nonce verification on all WooCommerce AJAX actions (`add_to_cart`, `load_variations`, `mark_paid`).
++* **FIX:** Security Update: Restricted WooCommerce appointment payment, date changes, and front-end cancellations strictly to signed-in appointment owners (`$appt_owner > 0`) or authorized calendar agents.
++* **FIX:** Security Update: Upgraded legacy 32-character iCal feed tokens to 64-character CSPRNG tokens (`random_bytes(32)`).
++* **FIX:** Security Update: Patched authentication bypass & account takeover vulnerabilities (CVE-2026-22341).
++* **FIX:** Security Update: Patched missing authorization & enforced strict Booking Agent calendar/appointment isolation across all admin, frontend-agent, and CSV export endpoints (CVE-2026-57746).
++* **FIX:** Security Update: Added CSRF nonce protection to profile updates, Frontend Agents, WooCommerce actions, CSV exports, registration, and admin notices (CVE-2026-57747).
++* **FIX:** Security Update: Validated booking dates, time slots, disabled slots, buffers, and limits on the server and stopped trusting client-supplied timestamps and user IDs.
++* **FIX:** Security Update: Sanitized custom fields and escaped outputs against Stored/Reflected XSS, neutralized CSV formula injection, and escaped iCalendar text properties against RFC 5545 property injection.
+ 
+ = 2.4.4 =
+ * **FIX:** Security Update: Patch for sensitive data exposure vulnerability. All calendar feeds have expired. Use new calendar feeds under Settings / Calendar Feeds.
+@@ -569,6 +579,3 @@
+ == Upgrade Notice ==
+ 
+ Lot's of bug fixes in this release, including support for WooCommerce 3.0. Be sure to update your add-ons as well!
+-
+-
+-For more freebies visit https://babia.to
+
+diff --git a/booked/templates/settings.php b/booked/templates/settings.php
+--- a/booked/templates/settings.php
++++ b/booked/templates/settings.php
+@@ -1764,6 +1764,7 @@
+ 
+ 									</div>
+ 
++									<?php wp_nonce_field( 'booked_export_csv_nonce', 'booked_export_nonce' ); ?>
+ 									<input type="hidden" name="booked_export_appointments_csv" value="1">
+ 
+ 								</form>
